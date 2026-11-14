@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "skipLibCheck": true,
+    "rewriteRelativeImportExtensions": true,
+    "strict": true,
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "removeComments": false,
+    "isolatedDeclarations": true,
+    "verbatimModuleSyntax": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}

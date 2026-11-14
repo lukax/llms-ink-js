@@ -1,0 +1,34 @@
+# Publishes llms-ink to npm (trusted publishing, provenance) and @lukax/llms-ink to JSR (GitHub OIDC) on a version tag (v0.3.0).
+# This folder is mirrored from the private llms.ink repo by scripts/mirror.mjs; edit it there.
+name: Publish
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Tag matches package.json and jsr.json
+        run: |
+          v="v$(node -p "require('./package.json').version")"
+          test "$v" = "$GITHUB_REF_NAME"
+          test "v$(node -p "require('./jsr.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm ci
+      - run: npm test
+      - name: npm
+        run: |
+          if npm view "llms-ink@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "npm already has ${GITHUB_REF_NAME#v}"; else npm publish --provenance --access public; fi
+      - name: JSR
+        run: |
+          if curl -fsS "https://jsr.io/@lukax/llms-ink/meta.json" | node -e "process.exit(JSON.parse(require('fs').readFileSync(0)).versions['${GITHUB_REF_NAME#v}'] ? 0 : 1)"; then echo "JSR already has ${GITHUB_REF_NAME#v}"; else npx -y jsr publish; fi
