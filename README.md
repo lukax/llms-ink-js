@@ -74,6 +74,16 @@ const { parsed, issues } = await ink.checkText(await readFile('public/llms.txt',
 Without `base`, `site` and `url` are `null`; without `base` and `links`, `llmsFull` is `null` and
 `links.checked` is 0. Up to 2 MB.
 
+### `ink.markdown(html, { url?, signal? })` → `Promise<string>`
+
+A page's HTML as Markdown, the way llms.ink reads pages: hidden-instruction text (comments, hidden elements,
+off-screen text addressed to AI), scripts, navigation, headers, footers and forms are dropped first. `url` (never
+fetched) resolves relative links. Up to 5 MB; nothing is stored.
+
+```ts
+const md = await ink.markdown(await readFile('dist/pricing/index.html', 'utf8'), { url: 'https://example.com/pricing/' });
+```
+
 ### `ink.stream(url, { mode?, fresh?, signal? })` → `AsyncGenerator<StreamEvent>`
 
 The same build as `llms()`, as it happens:
@@ -104,7 +114,15 @@ After `vite build` (not the dev server or SSR builds), writes `llms.txt` (and `l
 `site` into `build.outDir`. llms.ink reads the live site, so the files describe the previous deploy. If llms.ink
 fails, the plugin warns and keeps any existing file (e.g. one from `public/`); `strict: true` fails the build.
 Options: `site`, `full`, `key` (default `LLMS_INK_KEY`), `native` (default `true`; a file llms.ink generated before
-is regenerated, not echoed), `strict`, `timeout` (ms, default 300000), `baseUrl`.
+is regenerated, not echoed), `strict`, `timeout` (ms, default 300000), `baseUrl`, `markdownPages`.
+
+`markdownPages: true` also writes a Markdown version next to every HTML page of this build (`about.html` →
+`about.md`, `docs/index.html` → `docs/index.md`), converted with `ink.markdown()` from the local output, so the
+`.md` pages match what you're deploying. Existing `.md` files are kept; `/404`, `/500` and pages over 5 MB are
+skipped; a rate limit is waited out (`Retry-After`). Failures warn and the build goes on, unless `strict`. Pass
+`{ concurrency, exclude }` (default 4 at a time; `exclude` is a RegExp on the page path) to tune it. Large sites:
+use an API key (60 conversions a minute anonymous per IP, the key's own limit otherwise). They're static files:
+`/about.md` works as is; for `Accept: text/markdown` on the page URL, add a rewrite to `<page>.md` on your host.
 
 ### Astro: `llms-ink/astro`
 
@@ -136,6 +154,29 @@ answers `/<page>.md` and requests whose `Accept` prefers `text/markdown` over `t
 Everything else, and llms.ink's own fetcher, gets `undefined` (Express: `next()`). Options: `site`, `key` (default
 `LLMS_INK_KEY`; recommended on shared hosting IPs), `markdown`, `baseUrl`. Don't also ship a static `llms.txt`:
 most hosts serve it before the middleware runs.
+
+#### AI traffic
+
+```ts
+const llms = llmsInkHandler({ site: 'https://example.com', traffic: { key: env.LLMS_INK_KEY } });
+const response = (await llms(request, ctx)) ?? (await app(request)); // Workers: ctx; Next.js proxy: the event
+
+expressApp.use(llmsInkExpress({ site: 'https://example.com', traffic: { key: process.env.LLMS_INK_KEY } }));
+```
+
+With `traffic: { key, site?, flushEvery? }` the middleware also counts requests from AI agents (`AI_AGENTS`):
+user fetches (`ChatGPT-User`, `Claude-User`, `Perplexity-User`…, someone asked an assistant) and crawlers (`GPTBot`,
+`OAI-SearchBot`, `ClaudeBot`, `PerplexityBot`, `Googlebot`, `bingbot`…). It counts every request it sees, served or
+not, per path and agent in memory, and every `flushEvery` seconds (default 60, at least 10) sends the day's totals to
+`POST /api/v0/traffic`, at most 1000 rows per request. Only `{ site, period, rows: [{ path, agent, kind, count }] }`
+leaves your server: no IPs, user agents, query strings or cookies; browsers aren't counted. Sends never block a
+response: with `ctx` they go to `ctx.waitUntil`, without one (Node, Bun, Deno) an unref'd timer sends. Failed sends
+keep their counts and retry with backoff (honoring `Retry-After`); a `401` or `403 site_claimed` stops counting with
+one warning. `site` defaults to the middleware's hostname; the first key to send for a site owns it. Counts not yet
+sent are lost when the process stops: call `await llms.flush()` on shutdown. Read them at
+[llms.ink/traffic](https://llms.ink/traffic/) or `GET /api/v0/traffic?site=&days=` with the same key.
+`classifyAgent(userAgent)` and `trafficCounter({ key, site })` (`record(request, ctx?)`, `flush()`) are exported for
+other servers.
 
 ## Errors
 

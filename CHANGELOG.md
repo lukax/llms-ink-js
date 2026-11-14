@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0 — 2026-11-14
+
+- `ink.markdown(html, { url?, signal? })`: a page's HTML as Markdown (`POST /api/v0/markdown`): hidden-instruction
+  text, scripts, navigation, headers and footers dropped; relative links resolved against `url`.
+- `llms-ink/vite` and `llms-ink/astro`: `markdownPages: true | { concurrency?, exclude? }` writes a Markdown version
+  next to every HTML page of the build (`about.html` → `about.md`, `docs/index.html` → `docs/index.md`), converted
+  from the local output. Existing `.md` files are kept, pages over 5 MB and `/404`, `/500` are skipped, a `429` is
+  retried after `Retry-After`; failures warn (or fail the build with `strict`). `site` is optional with only
+  `markdownPages` (links then stay relative).
+- `ErrorCode` includes `too_large` and `unsupported_media_type` (413/415 of the POST endpoints).
+- `llms-ink/middleware`: `traffic: { key, site?, flushEvery? }` counts AI-agent requests (user fetches vs crawlers,
+  `AI_AGENTS`) per path and sends daily aggregates to `POST /api/v0/traffic` in the background (no IPs, user agents
+  or query strings), with batching and backoff. The handler takes an optional `ctx` (`waitUntil`) and both adapters
+  have `flush()`. Also exported: `classifyAgent`, `trafficCounter`. `ErrorCode` includes `key_required` and
+  `site_claimed`.
+
 ## 0.3.0 — 2026-11-14
 
 - `ink.checkText(text, { base?, links?, signal? })`: parses and checks llms.txt text (`POST /api/v0/check`).

@@ -39,6 +39,12 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify(q.base ? { ...CHECK_TEXT, url: q.base, site: new URL(q.base).origin } : CHECK_TEXT));
   }
+  if (req.method === 'POST' && url.pathname === '/api/v0/markdown') {
+    if (!/^text\/html/.test(req.headers['content-type'] ?? '')) return problem(res, 415, 'unsupported_media_type', 'Send HTML.');
+    if (body.length > 100) return problem(res, 413, 'too_large', 'Too large.');
+    res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8' });
+    return res.end(`# From ${q.url ?? 'nowhere'}\n\n${body.replace(/<[^>]+>/g, '')}\n`);
+  }
   const target = q.url ?? '';
   if (req.headers.authorization === 'Bearer lk_bad') return problem(res, 401, 'invalid_key', 'Unknown key.');
   if (target === 'rate.test') return problem(res, 429, 'rate_limited', 'Slow down.', {}, { 'retry-after': '42' });
@@ -172,6 +178,23 @@ test('checkText: problem → LlmsInkError', async () => {
   assert.ok(err instanceof LlmsInkError);
   assert.equal(err.code, 'invalid_request');
   assert.equal(err.status, 400);
+});
+
+test('markdown: POSTs the HTML as text/html with url, answers the Markdown text; problems → LlmsInkError', async () => {
+  const md = await ink.markdown('<h1>Hi</h1>', { url: 'https://example.com/a' });
+  assert.equal(md, '# From https://example.com/a\n\nHi\n');
+  assert.equal(last().method, 'POST');
+  assert.equal(last().path, '/api/v0/markdown');
+  assert.deepEqual(last().query, { url: 'https://example.com/a' });
+  assert.equal(last().body, '<h1>Hi</h1>');
+  assert.equal(last().headers['content-type'], 'text/html; charset=utf-8');
+  assert.equal(last().headers.accept, 'text/markdown');
+  assert.equal(await ink.markdown('<p>x</p>'), '# From nowhere\n\nx\n');
+  assert.deepEqual(last().query, {});
+  const err = await ink.markdown(`<p>${'x'.repeat(200)}</p>`).catch((e) => e);
+  assert.ok(err instanceof LlmsInkError);
+  assert.equal(err.status, 413);
+  assert.equal(err.code, 'too_large');
 });
 
 test('key: option and LLMS_INK_KEY, sent as Bearer', async () => {

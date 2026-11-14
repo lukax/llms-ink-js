@@ -10,10 +10,36 @@ import { pathToFileURL } from 'node:url';
 import { llmsInk as vitePlugin } from '../dist/vite.js';
 import astroIntegration from '../dist/astro.js';
 
-/** Every query the stub saw. */
+/** Every llms query the stub saw. */
 const seen = [];
-const server = createServer((req, res) => {
-  const q = Object.fromEntries(new URL(req.url, 'http://stub').searchParams);
+/** Every POST /api/v0/markdown: { url, body, type, auth }. */
+const posted = [];
+/** Pages (by body marker) that answer 429 once before converting. */
+const limitedOnce = new Set();
+let inFlight = 0;
+let maxInFlight = 0;
+const server = createServer(async (req, res) => {
+  const u = new URL(req.url, 'http://stub');
+  const q = Object.fromEntries(u.searchParams);
+  if (u.pathname === '/api/v0/markdown') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    posted.push({ url: q.url, body, type: req.headers['content-type'], auth: req.headers.authorization });
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    inFlight--;
+    const send = (status, payload, type = 'application/problem+json', headers = {}) => {
+      res.writeHead(status, { 'content-type': type, ...headers });
+      res.end(typeof payload === 'string' ? payload : JSON.stringify(payload));
+    };
+    if (body.includes('RATE') && !limitedOnce.has(body)) {
+      limitedOnce.add(body);
+      return send(429, { title: 'T', status: 429, code: 'rate_limited', detail: 'Slow down.' }, undefined, { 'retry-after': '0' });
+    }
+    if (body.includes('BROKEN')) return send(422, { title: 'T', status: 422, code: 'unprocessable', detail: 'No readable text.' });
+    return send(200, `# ${q.url ?? 'no url'}\n\n${body.replace(/<[^>]+>/g, '').trim()}\n`, 'text/markdown; charset=utf-8');
+  }
   seen.push(q);
   if (q.url.includes('down.test')) {
     res.writeHead(503, { 'content-type': 'application/problem+json' });
@@ -170,4 +196,110 @@ test('astro: llms.ink failing warns and keeps the existing file', async () => {
   await integration.hooks['astro:build:done']({ dir: pathToFileURL(`${dir}/`), logger: log, pages: [] });
   assert.equal(await readFile(join(dir, 'llms.txt'), 'utf8'), '# Old\n');
   assert.match(log.lines.warn[0], /kept the existing file/);
+});
+
+/** A build output with pages, a 404 page, a nested page and an asset. */
+async function siteFiles(dir, extra = {}) {
+  const files = {
+    'index.html': '<h1>Home</h1>',
+    'about.html': '<h1>About</h1>',
+    'docs/index.html': '<h1>Docs</h1>',
+    'docs/guide/index.html': '<h1>Guide</h1>',
+    '404.html': '<h1>Not found</h1>',
+    'assets/app.js': 'console.log(1)',
+    ...extra,
+  };
+  for (const [path, text] of Object.entries(files)) {
+    await mkdir(join(dir, path, '..'), { recursive: true });
+    await writeFile(join(dir, path), text);
+  }
+}
+
+test('vite markdownPages: a .md next to every page, page URLs from site, 404 skipped, HTML posted as text/html', async () => {
+  const root = await tempRoot();
+  await siteFiles(join(root, 'dist'));
+  const from = posted.length;
+  const { outDir, log } = await viteBuild({ site: 'https://ok.test', markdownPages: true, key: 'lk_test' });
+  assert.equal(await readFile(join(outDir, 'llms.txt'), 'utf8'), '# https://ok.test llms\n', 'llms.txt still written');
+  // viteBuild uses its own root: copy the site there instead.
+  assert.ok(log.lines.info.some((l) => /Wrote 0 Markdown pages/.test(l)), 'an empty build writes none');
+
+  const plugin = vitePlugin({ baseUrl, site: 'https://ok.test', markdownPages: true, key: 'lk_test' });
+  const log2 = logger();
+  plugin.configResolved({ root, build: { outDir: 'dist', ssr: false }, logger: log2 });
+  await plugin.closeBundle.call({ environment: { name: 'client', config: { build: { outDir: 'dist' } } } });
+  const out = join(root, 'dist');
+  assert.equal(await readFile(join(out, 'index.md'), 'utf8'), '# https://ok.test/\n\nHome\n');
+  assert.equal(await readFile(join(out, 'about.md'), 'utf8'), '# https://ok.test/about\n\nAbout\n');
+  assert.equal(await readFile(join(out, 'docs/index.md'), 'utf8'), '# https://ok.test/docs/\n\nDocs\n');
+  assert.equal(await readFile(join(out, 'docs/guide/index.md'), 'utf8'), '# https://ok.test/docs/guide/\n\nGuide\n');
+  await assert.rejects(readFile(join(out, '404.md')), { code: 'ENOENT' });
+  const mine = posted.slice(from);
+  assert.deepEqual(mine.map((p) => p.url).sort(), ['https://ok.test/', 'https://ok.test/about', 'https://ok.test/docs/', 'https://ok.test/docs/guide/']);
+  for (const p of mine) {
+    assert.equal(p.type, 'text/html; charset=utf-8');
+    assert.equal(p.auth, 'Bearer lk_test');
+  }
+  assert.ok(log2.lines.info.includes('[llms-ink] Wrote 4 Markdown pages.'), log2.lines.info.join('\n'));
+  assert.deepEqual(log2.lines.warn, []);
+});
+
+test('markdownPages: failures warn and the rest are written; strict fails; existing .md kept; >5 MB skipped', async () => {
+  const dir = await tempRoot();
+  await siteFiles(dir, {
+    'broken.html': '<p>BROKEN</p>',
+    'kept.html': '<p>Kept</p>',
+    'kept.md': '# Mine\n',
+    'huge.html': `<p>${'x'.repeat(5_000_001)}</p>`,
+  });
+  const log = logger();
+  const integration = astroIntegration({ baseUrl, site: 'https://ok.test', markdownPages: true });
+  await integration.hooks['astro:config:done']({ config: { site: 'https://ok.test', base: '/' } });
+  await integration.hooks['astro:build:done']({ dir: pathToFileURL(`${dir}/`), logger: log, pages: [] });
+  assert.equal(await readFile(join(dir, 'about.md'), 'utf8'), '# https://ok.test/about\n\nAbout\n');
+  assert.equal(await readFile(join(dir, 'kept.md'), 'utf8'), '# Mine\n');
+  await assert.rejects(readFile(join(dir, 'broken.md')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(dir, 'huge.md')), { code: 'ENOENT' });
+  assert.ok(log.lines.info.includes('Kept kept.md: it already exists.'));
+  assert.ok(log.lines.info.includes('Wrote 4 Markdown pages (2 skipped); 1 failed.'), log.lines.info.join('\n'));
+  assert.deepEqual(log.lines.warn, ['Skipped huge.html: over 5,000,000 bytes.', "Couldn't convert broken.html to Markdown: No readable text."]);
+
+  const strictDir = await tempRoot();
+  await siteFiles(strictDir, { 'broken.html': '<p>BROKEN</p>' });
+  const strict = astroIntegration({ baseUrl, site: 'https://ok.test', markdownPages: true, strict: true });
+  await strict.hooks['astro:config:done']({ config: { base: '/' } });
+  await assert.rejects(strict.hooks['astro:build:done']({ dir: pathToFileURL(`${strictDir}/`), logger: logger(), pages: [] }), /Couldn't convert broken\.html to Markdown/);
+  assert.equal(await readFile(join(strictDir, 'about.md'), 'utf8'), '# https://ok.test/about\n\nAbout\n', 'the other pages are written first');
+});
+
+test('markdownPages: astro base path in URLs, 429 retried after Retry-After, concurrency bounded, custom exclude', async () => {
+  const dir = await tempRoot();
+  const pages = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`p${i}.html`, `<p>Page ${i}</p>`]));
+  await siteFiles(dir, { ...pages, 'slow.html': '<p>RATE</p>', 'private/index.html': '<p>secret</p>' });
+  const from = posted.length;
+  maxInFlight = 0;
+  const log = logger();
+  const integration = astroIntegration({ baseUrl, markdownPages: { concurrency: 2, exclude: /^\/(private|404)/ } });
+  await integration.hooks['astro:config:done']({ config: { site: 'https://ok.test', base: '/docs' } });
+  await integration.hooks['astro:build:done']({ dir: pathToFileURL(`${dir}/`), logger: log, pages: [] });
+  assert.equal(await readFile(join(dir, 'docs/guide/index.md'), 'utf8'), '# https://ok.test/docs/docs/guide/\n\nGuide\n');
+  assert.equal(await readFile(join(dir, 'p3.md'), 'utf8'), '# https://ok.test/docs/p3\n\nPage 3\n');
+  assert.equal(await readFile(join(dir, 'slow.md'), 'utf8'), '# https://ok.test/docs/slow\n\nRATE\n');
+  await assert.rejects(readFile(join(dir, 'private/index.md')), { code: 'ENOENT' });
+  assert.equal(posted.slice(from).filter((p) => p.body.includes('RATE')).length, 2, 'retried once after the 429');
+  assert.equal(maxInFlight, 2);
+  assert.deepEqual(log.lines.warn, []);
+});
+
+test('markdownPages without site: pages converted without url, llms.txt warned about', async () => {
+  const dir = await tempRoot();
+  await siteFiles(dir);
+  const from = posted.length;
+  const log = logger();
+  const integration = astroIntegration({ baseUrl, markdownPages: true });
+  await integration.hooks['astro:config:done']({ config: { base: '/' } });
+  await integration.hooks['astro:build:done']({ dir: pathToFileURL(`${dir}/`), logger: log, pages: [] });
+  assert.equal(await readFile(join(dir, 'about.md'), 'utf8'), '# no url\n\nAbout\n');
+  assert.ok(posted.slice(from).every((p) => p.url === undefined));
+  assert.deepEqual(log.lines.warn, ['No `site` set: llms.txt not written.']);
 });

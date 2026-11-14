@@ -1,6 +1,6 @@
 {
   "name": "llms-ink",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Turn any link — site, docs section, page, GitHub repo, PDF or video — into llms.txt and llms-full.txt. Typed client for llms.ink, plus a Vite plugin, an Astro integration and middleware that serve the files from your site. No dependencies.",
   "type": "module",
   "exports": {
@@ -31,9 +31,9 @@
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "prepublishOnly": "npm run build && npm test",
-    "test": "npm run build && node --test test/client.test.mjs test/plugins.test.mjs test/middleware.test.mjs",
+    "test": "npm run build && node --test test/client.test.mjs test/plugins.test.mjs test/middleware.test.mjs test/traffic.test.mjs",
     "test:live": "npm run build && node --test test/live.test.mjs",
-    "test:bun": "npm run build && bun test ./test/client.test.mjs ./test/plugins.test.mjs ./test/middleware.test.mjs",
+    "test:bun": "npm run build && bun test ./test/client.test.mjs ./test/plugins.test.mjs ./test/middleware.test.mjs ./test/traffic.test.mjs",
     "test:bun:live": "npm run build && bun test --timeout 300000 ./test/live.test.mjs"
   },
   "keywords": ["llms.txt", "llms-full.txt", "llm", "ai", "markdown", "docs", "context", "rag", "sdk", "llms-ink", "vite-plugin", "astro-integration", "middleware"],

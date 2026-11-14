@@ -1,7 +1,7 @@
 /**
- * Serve llms.txt, llms-full.txt and (optionally) Markdown versions of pages from llms.ink, inside your own app.
- * A fetch-API handler for Cloudflare Workers, Next.js middleware, Deno, Bun and Hono, plus an Express/Connect
- * adapter.
+ * Serve llms.txt, llms-full.txt and (optionally) Markdown versions of pages from llms.ink, inside your own app, and
+ * (optionally) count AI-agent traffic. A fetch-API handler for Cloudflare Workers, Next.js middleware, Deno, Bun and
+ * Hono, plus an Express/Connect adapter.
  *
  * @example
  * ```ts
@@ -9,8 +9,8 @@
  *
  * const llms = llmsInkHandler({ site: 'https://example.com', markdown: true });
  * export default {
- *   async fetch(request: Request): Promise<Response> {
- *     return (await llms(request)) ?? fetch(request); // undefined: not ours, the app answers
+ *   async fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> {
+ *     return (await llms(request, ctx)) ?? fetch(request); // undefined: not ours, the app answers
  *   },
  * };
  * ```
@@ -20,6 +20,9 @@
 
 import { env } from './env.ts';
 import { DEFAULT_BASE_URL, VERSION, type Mode } from './index.ts';
+import { trafficCounter, type TrafficOptions, type WaitUntil } from './traffic.ts';
+
+export { AI_AGENTS, classifyAgent, trafficCounter, type AgentKind, type AiAgent, type TrafficBatch, type TrafficCounter, type TrafficOptions, type TrafficRow, type WaitUntil } from './traffic.ts';
 
 /** Options for {@link llmsInkHandler} and {@link llmsInkExpress}. */
 export interface LlmsInkHandlerOptions {
@@ -37,10 +40,23 @@ export interface LlmsInkHandlerOptions {
   markdown?: boolean;
   /** Defaults to the `LLMS_INK_API` environment variable, else https://llms.ink. */
   baseUrl?: string;
+  /**
+   * Count requests from AI agents (ChatGPT-User, Claude-User, GPTBot, ClaudeBot… see `AI_AGENTS`) per path and send
+   * daily aggregates to llms.ink every `flushEvery` seconds; read them at https://llms.ink/traffic/. Sends only
+   * `{ path, agent, kind, count }`: no IPs, user agents, query strings or cookies. Off unless set.
+   */
+  traffic?: TrafficOptions;
 }
 
-/** A fetch-API handler: a `Response` for the requests it serves, `undefined` for everything else. */
-export type LlmsInkHandler = (request: Request) => Promise<Response | undefined>;
+/**
+ * A fetch-API handler: a `Response` for the requests it serves, `undefined` for everything else. Pass the
+ * platform's `ctx` (Workers' `ExecutionContext`, Next.js's `NextFetchEvent`) so traffic sends outlive the response.
+ */
+export interface LlmsInkHandler {
+  (request: Request, ctx?: WaitUntil): Promise<Response | undefined>;
+  /** Sends the traffic counted so far (with `traffic`); resolves at once without it. */
+  flush(): Promise<void>;
+}
 
 const FILES: Record<string, Mode> = { '/llms.txt': 'llms', '/llms-full.txt': 'full' };
 /** llms.ink's own fetcher (`compatible; llms.ink/0.1`): answering it from llms.ink would loop. */
@@ -76,6 +92,7 @@ export function llmsInkHandler(options: LlmsInkHandlerOptions): LlmsInkHandler {
   if (key) headers.authorization = `Bearer ${key}`;
   const cache = new Map<string, Entry>();
   const pending = new Map<string, Promise<Response>>();
+  const traffic = options.traffic ? trafficCounter({ ...options.traffic, site: options.traffic.site ?? site.hostname, baseUrl: base }) : null;
 
   /** Fetches `upstream`; on failure the last good copy, else llms.ink's error. */
   async function refresh(upstream: string): Promise<Response> {
@@ -116,7 +133,8 @@ export function llmsInkHandler(options: LlmsInkHandlerOptions): LlmsInkHandler {
     return (await loading).clone();
   }
 
-  return async (request) => {
+  const handler = async (request: Request, ctx?: WaitUntil): Promise<Response | undefined> => {
+    traffic?.record(request, ctx);
     if (request.method !== 'GET' && request.method !== 'HEAD') return undefined;
     if (LLMS_INK_FETCHER.test(request.headers.get('user-agent') ?? '')) return undefined;
     const { pathname } = new URL(request.url);
@@ -136,6 +154,7 @@ export function llmsInkHandler(options: LlmsInkHandlerOptions): LlmsInkHandler {
     }
     return request.method === 'HEAD' ? new Response(null, response) : response;
   };
+  return Object.assign(handler, { flush: () => traffic?.flush() ?? Promise.resolve() });
 }
 
 /** Node's `IncomingMessage` (Express, Connect, plain `node:http`), as far as the adapter reads it. */
@@ -155,12 +174,16 @@ export interface NodeResponse {
 }
 
 /** Express/Connect middleware: `next()` when the request isn't one {@link llmsInkHandler} serves. */
-export type NodeMiddleware = (req: NodeRequest, res: NodeResponse, next: (err?: unknown) => void) => void;
+export interface NodeMiddleware {
+  (req: NodeRequest, res: NodeResponse, next: (err?: unknown) => void): void;
+  /** Sends the traffic counted so far (with `traffic`). */
+  flush(): Promise<void>;
+}
 
 /** {@link llmsInkHandler} as Express/Connect middleware: `app.use(llmsInkExpress({ site }))`. */
 export function llmsInkExpress(options: LlmsInkHandlerOptions): NodeMiddleware {
   const handle = llmsInkHandler(options);
-  return (req, res, next) => {
+  const middleware = (req: NodeRequest, res: NodeResponse, next: (err?: unknown) => void): void => {
     const headers = new Headers();
     for (const name of ['accept', 'user-agent']) {
       const value = req.headers[name];
@@ -176,6 +199,7 @@ export function llmsInkExpress(options: LlmsInkHandlerOptions): NodeMiddleware {
       })
       .catch(next);
   };
+  return Object.assign(middleware, { flush: handle.flush });
 }
 
 function pick(from: Headers, names: string[]): Headers {

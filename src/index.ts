@@ -16,7 +16,7 @@
 
 import { env } from './env.ts';
 
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 export const DEFAULT_BASE_URL = 'https://llms.ink';
 
 /* ── Response shapes (mirror src/lib/schemas.ts of the API) ──────────────── */
@@ -25,7 +25,7 @@ export const DEFAULT_BASE_URL = 'https://llms.ink';
 export type Mode = 'llms' | 'full';
 
 /** What the link is. */
-export type Kind = 'site' | 'section' | 'page' | 'repo' | 'document' | 'video';
+export type Kind = 'site' | 'section' | 'page' | 'repo' | 'document' | 'video' | 'channel';
 
 /** `native` = published by the site; `generated` = made by llms.ink. */
 export type Source = 'native' | 'generated';
@@ -149,10 +149,14 @@ export type ErrorCode =
   | 'invalid_request'
   | 'invalid_url'
   | 'invalid_key'
+  | 'key_required'
+  | 'site_claimed'
   | 'not_found'
   | 'unknown_version'
   | 'method_not_allowed'
   | 'payload_too_large'
+  | 'too_large'
+  | 'unsupported_media_type'
   | 'unprocessable'
   | 'rate_limited'
   | 'quota_exceeded'
@@ -294,6 +298,13 @@ export interface CheckTextOptions {
   signal?: AbortSignal;
 }
 
+/** Options for {@link LlmsInk.markdown}. */
+export interface MarkdownOptions {
+  /** Where the page lives (never fetched): relative links in the Markdown resolve against it. */
+  url?: string;
+  signal?: AbortSignal;
+}
+
 /** Browsers refuse or preflight a custom User-Agent, so it's only sent from servers. */
 const IS_BROWSER: boolean = 'document' in globalThis || 'WorkerGlobalScope' in globalThis;
 
@@ -358,6 +369,16 @@ export class LlmsInk {
   }
 
   /**
+   * A page's HTML as Markdown (`POST /api/v0/markdown`, up to 5 MB): hidden-instruction text, scripts, navigation,
+   * headers and footers dropped, the way llms.ink reads pages. Nothing is fetched or stored.
+   */
+  async markdown(html: string, options: MarkdownOptions = {}): Promise<string> {
+    const params: Record<string, string> = options.url ? { url: options.url } : {};
+    const res = await this.#request('/api/v0/markdown', params, 'text/markdown', options.signal, html, 'text/html; charset=utf-8');
+    return res.text();
+  }
+
+  /**
    * Like {@link LlmsInk.llms}, as the build happens: yields `progress` and `partial` events, then one
    * `result`. Errors — including a terminal `error` event — are thrown as {@link LlmsInkError}s.
    * Breaking out of the loop cancels the request.
@@ -417,9 +438,9 @@ export class LlmsInk {
     return known ? (event as StreamEvent) : undefined;
   }
 
-  async #request(path: string, params: Record<string, string>, accept: string, signal: AbortSignal | undefined, body?: string): Promise<Response> {
+  async #request(path: string, params: Record<string, string>, accept: string, signal: AbortSignal | undefined, body?: string, type = 'text/markdown; charset=utf-8'): Promise<Response> {
     const headers: Record<string, string> = { accept };
-    if (body !== undefined) headers['content-type'] = 'text/markdown; charset=utf-8';
+    if (body !== undefined) headers['content-type'] = type;
     if (!IS_BROWSER) headers['user-agent'] = `llms-ink-js/${VERSION}`;
     if (this.key) headers.authorization = `Bearer ${this.key}`;
     const query = new URLSearchParams(params).toString();
