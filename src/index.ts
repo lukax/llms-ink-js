@@ -19,7 +19,7 @@ export type { InspectionReceipt } from './inspect.ts';
 
 import { env } from './env.ts';
 
-export const VERSION = '0.5.0';
+export const VERSION = '0.6.0';
 export const DEFAULT_BASE_URL = 'https://llms.ink';
 
 /* ── Response shapes (mirror src/lib/schemas.ts of the API) ──────────────── */
@@ -145,6 +145,45 @@ export interface CheckResult {
   summary: { errors: number; warnings: number };
   /** ISO 8601 date-time. */
   checkedAt: string;
+}
+
+/** `pass` is fine; `warn` is worth fixing; `fail` keeps agents out or empties the page for them; `info` is a fact. */
+export type ReportStatus = 'pass' | 'warn' | 'fail' | 'info';
+
+/** How to fix a check that didn't pass. */
+export interface ReportFix {
+  /** Where the change goes. */
+  kind: 'robots' | 'markdown' | 'llms-txt' | 'indexnow' | 'content' | 'html' | 'headers' | 'other';
+  /** What to change, in a sentence. */
+  summary: string;
+  /** A concrete change, when one is possible: `file` from the site root and its new content or lines to add. */
+  patch?: { file: string; content: string };
+}
+
+/** One check of the agent's-eye report. */
+export interface ReportCheck {
+  /** Stable name of the check, e.g. `bots-search`, `raw-text`. */
+  id: string;
+  status: ReportStatus;
+  title: string;
+  /** What was found, for people. */
+  detail: string;
+  /** What it's based on: lines, headers, snippets, sizes. */
+  evidence?: string;
+  fix?: ReportFix;
+}
+
+/** `GET /api/v0/report`: how AI crawlers and agents see a page, each problem with its fix. */
+export interface ReportResult {
+  /** The page reported on, after normalization and redirects. */
+  url: string;
+  /** Its origin. */
+  site: string;
+  /** ISO 8601 date-time. */
+  checkedAt: string;
+  summary: { pass: number; warn: number; fail: number; info: number };
+  /** In order: access, rendering, extraction, retrieval, hidden instructions, agent files. */
+  sections: Array<{ id: string; title: string; checks: ReportCheck[] }>;
 }
 
 /** Every error code the API answers with (https://llms.ink/docs/#errors). */
@@ -295,6 +334,11 @@ export interface CheckOptions {
   signal?: AbortSignal;
 }
 
+/** Options for {@link LlmsInk.report}. */
+export interface ReportOptions {
+  signal?: AbortSignal;
+}
+
 /** Options for {@link LlmsInk.checkText}. */
 export interface CheckTextOptions {
   /** Public URL the text lives at: resolves relative links and is reported as `url` / `site`. */
@@ -398,6 +442,15 @@ export class LlmsInk {
   async check(url: string, options: CheckOptions = {}): Promise<CheckResult> {
     const res = await this.#request('/api/v0/check', { url }, 'application/json', options.signal);
     return (await this.#json(res)) as CheckResult;
+  }
+
+  /**
+   * How AI crawlers and agents see a page (`GET /api/v0/report`): robots.txt per AI bot, firewall blocks, text
+   * without JavaScript, Markdown conversion, hidden instructions and agent files, each problem with its fix.
+   */
+  async report(url: string, options: ReportOptions = {}): Promise<ReportResult> {
+    const res = await this.#request('/api/v0/report', { url }, 'application/json', options.signal);
+    return (await this.#json(res)) as ReportResult;
   }
 
   /** Parses and checks llms.txt text you already have (`POST /api/v0/check`); nothing is published. */

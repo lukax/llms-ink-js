@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0
+
+- `llms-ink/ai`: `llmsInkTools({ client?, maxChars?, include? })`, Vercel AI SDK tools (`llmsTxt`, `llmsFullTxt`,
+  `checkLlmsTxt`, `agentView`) built with `tool()` and zod `inputSchema` for `generateText`, `streamText` and agents.
+  Text is cut to `maxChars` (default 40000) with a note and `truncated: true`; API errors return
+  `{ error, code?, retryAfter? }` for the model instead of throwing; an invalid key throws. `ai` (5 and later) and
+  `zod` are optional peer dependencies. The README shows connecting https://llms.ink/mcp with the AI SDK's MCP client.
+- `ink.report(url, { signal? })`: how AI crawlers and agents see a page (`GET /api/v0/report`), typed as
+  `ReportResult`.
+
 ## 0.5.0 — 2026-11-14
 
 - Explicit hosted `inspect(text)` with immutable, digest-bound receipts and pilot revision validation.

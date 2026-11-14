@@ -20,6 +20,11 @@ const CHECK = {
   },
 };
 const CHECK_TEXT = { ...CHECK, site: null, url: null, llmsFull: null, links: { total: 1, checked: 0, broken: [] } };
+const REPORT = {
+  url: 'https://example.com/', site: 'https://example.com', checkedAt: '2026-11-14T00:00:00.000Z',
+  summary: { pass: 1, warn: 0, fail: 0, info: 0 },
+  sections: [{ id: 'access', title: 'Access', checks: [{ id: 'firewall', status: 'pass', title: 'Firewall', detail: 'Bots get the page.' }] }],
+};
 
 /** Every request the stub saw: { path, query, headers }. */
 const seen = [];
@@ -56,6 +61,10 @@ const server = createServer(async (req, res) => {
   }
   if (target === 'html.test') { res.writeHead(502, { 'content-type': 'text/html' }); return res.end('<h1>Bad gateway</h1>'); }
   if (target === 'notjson.test') { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end('hello'); }
+  if (url.pathname === '/api/v0/report') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify(REPORT));
+  }
   if (url.pathname === '/api/v0/check') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify(CHECK));
@@ -138,6 +147,14 @@ test('llms: rejects an unknown mode before any request', async () => {
   const before = seen.length;
   await assert.rejects(ink.llms('example.com', { mode: 'index' }), TypeError);
   assert.equal(seen.length, before);
+});
+
+test('report: query and result', async () => {
+  assert.deepEqual(await ink.report('example.com'), REPORT);
+  assert.equal(last().path, '/api/v0/report');
+  assert.deepEqual(last().query, { url: 'example.com' });
+  assert.equal(last().headers.accept, 'application/json');
+  await assert.rejects(ink.report('rate.test'), RateLimitedError);
 });
 
 test('check: query and result', async () => {

@@ -3,7 +3,7 @@
 Turn any link — site, docs section, page, GitHub repo, PDF or video — into llms.txt and llms-full.txt. A typed
 client for the [llms.ink](https://llms.ink) API with no dependencies. Runs on Node 18+, Bun, Deno, Cloudflare
 Workers and browsers. Also a [Vite plugin, an Astro integration and middleware](#serve-llmstxt-from-your-site) that
-serve llms.txt from your own site.
+serve llms.txt from your own site, and [tools for the Vercel AI SDK](#vercel-ai-sdk-llms-inkai).
 
 ```sh
 npm install llms-ink        # or: bun add llms-ink
@@ -83,6 +83,13 @@ fetched) resolves relative links. Up to 5 MB; nothing is stored.
 ```ts
 const md = await ink.markdown(await readFile('dist/pricing/index.html', 'utf8'), { url: 'https://example.com/pricing/' });
 ```
+
+### `ink.report(url, { signal? })` → `Promise<ReportResult>`
+
+How AI crawlers and agents see a page (`GET /api/v0/report`): robots.txt per AI bot, firewall blocks, text without
+JavaScript, what survives Markdown conversion, hidden instructions and agent files. `{ url, site, checkedAt,
+summary: { pass, warn, fail, info }, sections: [{ id, title, checks: [{ id, status, title, detail, evidence?, fix? }] }] }`;
+a `fix` has `kind`, `summary` and, when possible, a `patch: { file, content }`.
 
 ### `ink.stream(url, { mode?, fresh?, signal? })` → `AsyncGenerator<StreamEvent>`
 
@@ -177,6 +184,65 @@ sent are lost when the process stops: call `await llms.flush()` on shutdown. Rea
 [llms.ink/traffic](https://llms.ink/traffic/) or `GET /api/v0/traffic?site=&days=` with the same key.
 `classifyAgent(userAgent)` and `trafficCounter({ key, site })` (`record(request, ctx?)`, `flush()`) are exported for
 other servers.
+
+## Vercel AI SDK: `llms-ink/ai`
+
+```sh
+npm install llms-ink ai zod
+```
+
+```ts
+import { generateText, stepCountIs } from 'ai';
+import { llmsInkTools } from 'llms-ink/ai';
+
+const { text } = await generateText({
+  model: 'openai/gpt-5',
+  tools: llmsInkTools(),
+  stopWhen: stepCountIs(5),
+  prompt: 'How do I paginate with the Stripe API? Read docs.stripe.com first.',
+});
+```
+
+`llmsInkTools({ client?, maxChars?, include? })` returns AI SDK tools (`tool()` with zod `inputSchema`, AI SDK 5 and
+later; tested with 7) for `generateText`, `streamText` and agents:
+
+| Tool | Input | Returns |
+|---|---|---|
+| `llmsTxt` | `url`, `fresh?` | `{ url, title, kind, source, tokens, pages, cached, text, truncated }`: the llms.txt index |
+| `llmsFullTxt` | `url`, `fresh?` | The same with llms-full.txt: up to 20 pages inlined, or a video's transcript |
+| `checkLlmsTxt` | `url`, or `text` with `base?`, `links?` | `{ url, site, found, summary, text, truncated }`: each issue with its line |
+| `agentView` | `url` | `{ url, site, summary, text, truncated }`: every check of `ink.report()` with its fix |
+
+- `client`: an `LlmsInk`, or its options (`{ key, baseUrl, fetch }`; `key` defaults to `LLMS_INK_KEY`).
+- `maxChars`: longest `text` a tool returns (default 40000). Longer text is cut at a line break and ends with
+  `[Truncated: showing N of M characters. …]`, with `truncated: true`.
+- `include`: only these tools, e.g. `llmsInkTools({ include: ['llmsTxt', 'checkLlmsTxt'] })`. The return type
+  narrows to them.
+
+API errors don't throw: the tool returns `{ error, code?, retryAfter? }` for the model to read, e.g.
+`{ error: 'llms.ink rate limit: wait 42 seconds, then try again.', code: 'rate_limited', retryAfter: 42 }`.
+An invalid API key (`InvalidKeyError`) and aborts (`abortSignal`) throw.
+
+### Or connect the MCP server
+
+The AI SDK also takes tools from an MCP client. https://llms.ink/mcp gives the same tools plus `video_frame`,
+`create_clip_link` and `generate_draft`, with snake_case names (`llms_txt`, `llms_full_txt`…) and text results:
+
+```ts
+import { createMCPClient } from '@ai-sdk/mcp'; // AI SDK 5: @ai-sdk/mcp@ai-v5, as experimental_createMCPClient
+
+const mcp = await createMCPClient({
+  transport: { type: 'http', url: 'https://llms.ink/mcp', headers: { authorization: `Bearer ${process.env.LLMS_INK_KEY}` } },
+});
+try {
+  const { text } = await generateText({ model: 'openai/gpt-5', tools: await mcp.tools(), stopWhen: stepCountIs(5), prompt });
+} finally {
+  await mcp.close();
+}
+```
+
+Leave out `headers` to use it anonymously. `llms-ink/ai` needs no extra package or connection and returns
+structured results cut to `maxChars`.
 
 ## Errors
 
