@@ -42,3 +42,8 @@ test('real fetch refuses redirect and honors cancellation',async()=>{
  try{const ink=new LlmsInk({key,baseUrl:`http://127.0.0.1:${server.address().port}`});await assert.rejects(ink.inspect('x'),LlmsInkError);assert.equal(forwarded,0);const c=new AbortController();c.abort();await assert.rejects(ink.inspect('x',{signal:c.signal}),e=>e.name==='AbortError');}
  finally{await new Promise(r=>server.close(r));}
 });
+test('shared receipt conformance corpus',async()=>{
+ const {readFile}=await import('node:fs/promises');const {inspectionReceipt}=await import('../dist/inspect.js');
+ const {cases}=JSON.parse(await readFile(new URL('fixtures/inspect-receipts-v1.json',import.meta.url)));
+ for(const c of cases){if(c.valid)assert.doesNotThrow(()=>inspectionReceipt(c.receipt,c.digest,c.status),c.name);else assert.throws(()=>inspectionReceipt(c.receipt,c.digest,c.status),c.name);}
+});
