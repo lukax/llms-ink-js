@@ -14,9 +14,12 @@
  * @module
  */
 
+import { prepareInspection, inspectionJson, inspectionReceipt, type InspectionReceipt } from './inspect.ts';
+export type { InspectionReceipt } from './inspect.ts';
+
 import { env } from './env.ts';
 
-export const VERSION = '0.4.0';
+export const VERSION = '0.5.0';
 export const DEFAULT_BASE_URL = 'https://llms.ink';
 
 /* ── Response shapes (mirror src/lib/schemas.ts of the API) ──────────────── */
@@ -146,6 +149,9 @@ export interface CheckResult {
 
 /** Every error code the API answers with (https://llms.ink/docs/#errors). */
 export type ErrorCode =
+  | 'inspection_not_enabled'
+  | 'inspection_quota'
+  | 'inspection_unavailable'
   | 'invalid_request'
   | 'invalid_url'
   | 'invalid_key'
@@ -331,11 +337,13 @@ export class LlmsInk {
   readonly key: string | undefined;
   /** Origin of the API, without a trailing slash. */
   readonly baseUrl: string;
+  readonly #inspectBaseUrl: string;
   readonly #fetch: typeof fetch;
 
   constructor(options: LlmsInkOptions = {}) {
     const key = (options.key ?? env('LLMS_INK_KEY'))?.trim();
     this.key = key || undefined;
+    this.#inspectBaseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.baseUrl = (options.baseUrl ?? env('LLMS_INK_API') ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     if (!options.fetch && typeof globalThis.fetch !== 'function') {
       throw new TypeError('No global fetch: use Node 18+ or pass options.fetch.');
@@ -351,6 +359,39 @@ export class LlmsInk {
   async llms(url: string, options: LlmsOptions = {}): Promise<Result> {
     const res = await this.#request('/api/v0/llms', llmsParams(url, options), 'application/json', options.signal);
     return (await this.#json(res)) as Result;
+  }
+
+  /**
+   * Explicitly upload supplied text to the hosted Inspect pilot. Requires an enabled key.
+   * The receipt binds to these exact UTF-8 bytes; no finding is not a safety guarantee.
+   * No retries. 65-second default deadline. LLMS_INK_API is ignored; baseUrl must be explicit.
+   * Keep keys server-side. Malformed receipts and HTTP problems throw LlmsInkError.
+   */
+  async inspect(text: string, options: { signal?: AbortSignal } = {}): Promise<InspectionReceipt> {
+    if (!this.key) throw new LlmsInkError('Inspect requires an inspection-enabled API key.', {code:'key_required'});
+    const {body, digest} = await prepareInspection(text, this.#inspectBaseUrl);
+    const controller = new AbortController();
+    const abort = () => controller.abort(options.signal?.reason);
+    const timer = setTimeout(() => controller.abort(new DOMException('Inspection timed out.', 'TimeoutError')), 65000);
+    if(options.signal?.aborted) abort();
+    options.signal?.addEventListener('abort', abort, {once:true});
+    try {
+      const res = await this.#fetch(`${this.#inspectBaseUrl}/api/v0/inspect`, {
+        method:'POST', redirect:'error', signal:controller.signal,
+        headers:{authorization:`Bearer ${this.key}`, 'content-type':'application/json', accept:'application/json'}, body,
+      });
+      const data = await inspectionJson(res);
+      if (!res.ok && data && typeof data === 'object' && !('detection' in data)) {
+        const p = data as Partial<Problem>;
+        throw errorFor(p.detail || p.title || `Inspect returned HTTP ${res.status}.`, {status:res.status, code:p.code, retryAfter:retryAfter(res.headers.get('retry-after'))});
+      }
+      return inspectionReceipt(data, digest, res.status);
+    } catch (err) {
+      if (err instanceof LlmsInkError || isAbort(err)) throw err;
+      throw new LlmsInkError('Inspection did not return a valid receipt. Withhold the content.', {code:'inspection_unavailable'});
+    } finally {
+      clearTimeout(timer); options.signal?.removeEventListener('abort', abort);
+    }
   }
 
   /** Checks a site's published llms.txt against the llmstxt.org format and that its links answer. */
