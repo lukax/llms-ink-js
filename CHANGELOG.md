@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0 — 2026-11-15
+
+- Require Python Guard 0.14.0+ for the optional Claude adapter. Create a host-bound session and confirm its owner watcher before starting Claude; older services are refused without an unbound fallback.
+- End session authority on observed host/watcher disconnection, including abrupt host termination. Keep fixed expiry, per-call review and non-resumable conversations; stopped processes can delay disconnect observation until expiry.
+- Report `host_watch_failed` and `host_watch_cleanup_failed` without raw subprocess text. A subsequent run on a closing conversation still surfaces unconfirmed revocation and recovery metadata.
+- Add real-process termination and malformed-startup tests. The base SDK and hosted receipt contract remain unchanged.
+
 ## 0.7.2 — 2026-11-15
 
 - Handle Claude subscription rate-status events arriving before initialization. Early status is discarded; session identity, guard connection and tool inventory must still pass before use.

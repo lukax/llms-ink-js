@@ -2,6 +2,9 @@ import {test,mock} from 'node:test';
 import assert from 'node:assert/strict';
 import {existsSync} from 'node:fs';
 import {dirname} from 'node:path';
+import {spawn,execFileSync} from 'node:child_process';
+import {createInterface} from 'node:readline';
+import {once} from 'node:events';
 import {fixture,python,pause,wire,ctl} from './guard-fixture.mjs';
 let latest,behavior='normal';
 mock.module('@anthropic-ai/claude-agent-sdk',{namedExports:{query:({prompt,options})=>{
@@ -47,11 +50,69 @@ mock.module('@anthropic-ai/claude-agent-sdk',{namedExports:{query:({prompt,optio
 const {createGuardedClaude,GuardHostError}=await import('../dist/guard-claude.js');
 const opts=(f,review=async()=>false)=>({python,ownerFile:f.ownerFile,cwd:f.dir,review});
 const settings={skip:!python,timeout:30000};
+async function until(check) {
+ for(let n=0;n<150;n++){if(await check())return;await pause(20);}
+ assert.fail('Lifecycle condition did not complete');
+}
+function watcherPid(parent,sessionId){
+ const lines=execFileSync('ps',['-axo','pid,ppid,command'],{encoding:'utf8'}).split('\n');
+ const candidates=lines.map(line=>line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).filter(m=>m&&Number(m[2])===parent&&m[3].includes('session-watch')&&m[3].includes(sessionId));
+ assert.equal(candidates.length,1);return Number(candidates[0][1]);
+}
+test('watcher loss aborts a pending review and refuses its late acceptance',settings,async()=>{
+ const f=await fixture();let c,accept,seen,signal;const reached=new Promise(r=>seen=r);
+ try{
+  c=await createGuardedClaude(opts(f,r=>{signal=r.signal;seen();return new Promise(resolve=>accept=resolve);}));
+  const running=c.run('safe');const failure=assert.rejects(running,error=>error.code==='host_watch_failed');await reached;
+  process.kill(watcherPid(process.pid,c.sessionId),'SIGKILL');await failure;
+  assert.equal(signal.aborted,true);accept(true);await c.close();
+  assert.ok(!f.status().sessions.some(s=>s.sessionId===c.sessionId&&s.active));assert.deepEqual(await f.effects(),[]);
+ }finally{await c?.close();await f.close();}
+});
+for(const mode of ['unsupported','bad-ack','extra-output'])test(mode+' never falls back to an unbound session',settings,async()=>{
+ const f=await fixture();let c;const before=latest;
+ try{
+  const {writeFile}=await import('node:fs/promises');const wrapper=f.dir+'/python-fixture';
+  await writeFile(wrapper,`#!${python}\nimport os,sys,json\nmode=${JSON.stringify(mode)}\nif mode=='unsupported' and '--host-bound' in sys.argv: sys.exit(2)\nif 'session-watch' in sys.argv:\n print('PRIVATE malformed acknowledgement' if mode=='bad-ack' else json.dumps({'ok':True,'sessionId':sys.argv[-1]})+'\\nPRIVATE extra output',flush=True)\n sys.stdin.buffer.read()\nelse: os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])\n`,{mode:0o700});
+  await assert.rejects(async()=>{c=await createGuardedClaude({...opts(f),python:wrapper});},error=>{
+   assert.equal(error.code,mode==='unsupported'?'session_create_failed':'host_watch_failed');assert.ok(!error.message.includes('PRIVATE'));return true;
+  });
+  assert.equal(latest,before);assert.ok(!f.status().sessions.some(s=>s.active));assert.deepEqual(await f.effects(),[]);
+ }finally{await c?.close();await f.close();}
+});
+test('killing the host process revokes its shared capability without waiting for TTL',settings,async()=>{
+ const f=await fixture();let child,connection,dir,watcher,ended,lines;
+ try{
+  const program=`import {mock} from 'node:test';
+   let config;mock.module('@anthropic-ai/claude-agent-sdk',{namedExports:{query:({options})=>{config=options;return{close(){},next(){return new Promise(()=>{});}};}}});
+   const {createGuardedClaude}=await import(${JSON.stringify(new URL('../dist/guard-claude.js',import.meta.url).href)});
+   const c=await createGuardedClaude({...${JSON.stringify({python,ownerFile:f.ownerFile,cwd:f.dir,ttl:60})},review:async()=>false});
+   console.log(JSON.stringify({sessionId:c.sessionId,file:config.mcpServers.guarded.args.at(-1)}));`;
+  child=spawn(process.execPath,['--experimental-test-module-mocks','--input-type=module','-e',program],{cwd:new URL('..',import.meta.url),stdio:['ignore','pipe','pipe']});child.stderr.resume();ended=once(child,'exit');
+  lines=createInterface({input:child.stdout});let timer;
+  const [raw]=await Promise.race([once(lines,'line'),ended.then(()=>{throw Error('Host fixture exited early');}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Host fixture unavailable')),10000);})]).finally(()=>clearTimeout(timer));
+  const state=JSON.parse(raw);dir=dirname(state.file);watcher=watcherPid(child.pid,state.sessionId);
+  connection=wire({mcpServers:{guarded:{command:python,args:['-m','llms_ink.guard','connect','--session-file',state.file]}}});
+  connection.send({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-11-25',capabilities:{elicitation:{form:{}}}}});await connection.next();
+  connection.send({jsonrpc:'2.0',method:'notifications/initialized'});connection.send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}});await connection.next();
+  connection.send({jsonrpc:'2.0',id:3,method:'tools/call',params:{name:'fixture__record',arguments:{destination:'safe'}}});assert.equal((await connection.next()).method,'elicitation/create');
+  const disconnected=assert.rejects(connection.next(),/Connector closed/);
+  child.kill('SIGKILL');await ended;await disconnected;
+  await until(()=>!f.status().sessions.some(s=>s.sessionId===state.sessionId&&s.active));
+  await until(()=>{try{process.kill(watcher,0);return false;}catch(error){return error.code==='ESRCH';}});
+  assert.deepEqual(await f.effects(),[]);
+ }finally{
+  if(child&&child.exitCode===null&&child.signalCode===null){child.kill('SIGKILL');await ended;}
+  connection?.close();lines?.close();await f.close();
+  if(dir){const {rm}=await import('node:fs/promises');await rm(dir,{recursive:true,force:true});}
+ }
+});
 test('one session across turns, new conversations isolated, close revokes and removes credentials',settings,async()=>{
  const f=await fixture();let a,b;
  try{
   a=await createGuardedClaude(opts(f,async r=>{assert.match(r.message,/policySha256/);assert.match(r.message,/destination/);return true;}));
   const first=latest, dir=dirname(first.mcpServers.guarded.args.at(-1));
+  const state=f.status().sessions.find(s=>s.sessionId===a.sessionId);assert.equal(state.hostBound,true);assert.equal(state.hostConnected,true);
   assert.equal(JSON.stringify(first).includes(f.ownerFile),false);assert.equal(first.persistSession,false);assert.equal(first.strictMcpConfig,true);assert.deepEqual(first.tools,[]);assert.equal((await first.canUseTool('Bash',{})).behavior,'deny');
   await a.run('safe');await a.run('safe');assert.equal((await f.effects()).length,2);
   b=await createGuardedClaude(opts(f));assert.notEqual(a.sessionId,b.sessionId);await b.run('safe');assert.equal((await f.effects()).length,2);
@@ -109,7 +170,7 @@ test('a stalled output callback cannot keep a timed-out conversation authorized'
 });
 test('external revocation refuses future turns without dispatch',settings,async()=>{
  const f=await fixture();let c;
- try{c=await createGuardedClaude(opts(f,async()=>true));await c.run('no-tool');ctl(f.ownerFile,'session-revoke','--session-id',c.sessionId);await assert.rejects(c.run('safe'),error=>error.code==='session_inactive');assert.deepEqual(await f.effects(),[]);}finally{await c?.close();await f.close();}
+ try{c=await createGuardedClaude(opts(f,async()=>true));await c.run('no-tool');ctl(f.ownerFile,'session-revoke','--session-id',c.sessionId);await assert.rejects(c.run('safe'),error=>['session_inactive','host_watch_failed'].includes(error.code));assert.deepEqual(await f.effects(),[]);}finally{await c?.close();await f.close();}
 });
 test('failed revocation retains recovery metadata and the private credential',settings,async()=>{
  const f=await fixture();let c,dir;
@@ -144,10 +205,10 @@ test('cleanup failure retains the operation code and recoverable credential',set
   assert.equal(error.code,'host_cleanup_failed');assert.equal(error.operationCode,'host_result_error');assert.equal(error.sessionId,c.sessionId);dir=error.credentialDirectory;assert.ok(existsSync(dir));assert.ok(!error.message.includes('PRIVATE'));return true;
  });assert.ok(!f.status().sessions.some(s=>s.active));behavior='normal';await c.close();assert.equal(existsSync(dir),false);}finally{behavior='normal';await c?.close();await f.close();}
 });
-test('service loss identifies status failure while keeping unconfirmed revocation primary',settings,async()=>{
+test('service loss keeps unconfirmed revocation primary after status or watcher notices it',settings,async()=>{
  const f=await fixture();let c,dir;
  try{c=await createGuardedClaude(opts(f));await c.run('no-tool');f.proc.kill('SIGTERM');await new Promise(r=>f.proc.once('exit',r));
-  await assert.rejects(c.run('no-tool'),error=>{assert.equal(error.code,'revocation_unconfirmed');assert.equal(error.operationCode,'service_status_failed');dir=error.credentialDirectory;assert.ok(existsSync(dir));return true;});
+  await assert.rejects(c.run('no-tool'),error=>{assert.equal(error.code,'revocation_unconfirmed');assert.ok(['service_status_failed','host_watch_failed'].includes(error.operationCode));dir=error.credentialDirectory;assert.ok(existsSync(dir));return true;});
  }finally{await f.close();if(dir){const {rm}=await import('node:fs/promises');await rm(dir,{recursive:true,force:true});}}
 });
 test('an output failure after an approved effect revokes without replaying the action',settings,async()=>{
