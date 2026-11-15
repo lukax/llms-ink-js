@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1 — 2026-11-14
+
+- Fixed failure codes distinguish local service checks, host connection/inventory/identity, stream termination, host-reported limits, output callbacks, deadlines and session expiry without copying raw host errors.
+- Cleanup failures preserve the original operation code and recovery credentials. The terminal example reports both codes; unknown provider messages remain private.
+- Expanded real-service failure tests verify revocation, no dispatch and sanitized diagnostics. Permissions, inspection and approval requirements are unchanged. The earlier unclassified live-host failure remains unresolved; these diagnostics do not retroactively identify its cause.
+
 ## 0.7.0 — 2026-11-14
 
 - Optional Node/POSIX `llms-ink/guard/claude` host adapter: one authenticated local Guard session per non-resumable Claude SDK conversation, shared across sequential turns and revoked on close.

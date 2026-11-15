@@ -38,11 +38,22 @@ export interface GuardedClaudeConversation {
   /** Revoke authority and close the host. Idempotent after confirmed cleanup; retry on cleanup errors. */
   close(): Promise<void>;
 }
+/** Local failure categories. No provider text, tool output or credentials are copied into these values. */
+export type GuardHostErrorCode = 'host_error' | 'session_create_failed' | 'host_startup_failed'
+  | 'service_status_failed' | 'session_inactive' | 'host_stream_failed' | 'host_stream_ended'
+  | 'session_mismatch' | 'guard_connection_failed' | 'unexpected_tools' | 'host_not_initialized'
+  | 'message_callback_failed' | 'host_result_error' | 'host_turn_limit' | 'host_budget_limit'
+  | 'host_output_retry_limit' | 'turn_timeout' | 'session_expired' | 'conversation_closed'
+  | 'revocation_unconfirmed' | 'host_cleanup_failed' | 'credential_cleanup_failed';
 export class GuardHostError extends Error {
   readonly sessionId: string | undefined;
   readonly credentialDirectory: string | undefined;
-  constructor(message: string, sessionId?: string, credentialDirectory?: string) {
+  readonly code: GuardHostErrorCode;
+  /** Original operation failure when cleanup itself failed. Cleanup remains the primary error. */
+  readonly operationCode: GuardHostErrorCode | undefined;
+  constructor(message: string, sessionId?: string, credentialDirectory?: string, code: GuardHostErrorCode = 'host_error', operationCode?: GuardHostErrorCode) {
     super(message); this.name = 'GuardHostError'; this.sessionId = sessionId; this.credentialDirectory = credentialDirectory;
+    this.code = code; this.operationCode = operationCode;
   }
 }
 
@@ -110,7 +121,7 @@ export async function createGuardedClaude(options: GuardedClaudeOptions): Promis
       try {
         const state=await control(python,['service-status','--owner-file',ownerFile]);
         if(state.ok!==true || !Array.isArray(state.sessions) || state.sessions.some(s=>!s || typeof s!=='object' || typeof s.sessionId!=='string' || (s.sessionId===sessionId && s.active!==false))) throw new Error();
-      } catch { throw new GuardHostError('Session revocation could not be confirmed. Keep the credential directory and retry close or revoke it with the owner CLI.',sessionId,directory); }
+      } catch { throw new GuardHostError('Session revocation could not be confirmed. Keep the credential directory and retry close or revoke it with the owner CLI.',sessionId,directory,'revocation_unconfirmed'); }
     }
   }
   try {
@@ -124,14 +135,20 @@ export async function createGuardedClaude(options: GuardedClaudeOptions): Promis
     if(!sessionId) {
       try { const saved=JSON.parse(await readFile(file,'utf8')); if(typeof saved.sessionId==='string' && idPattern.test(saved.sessionId)) sessionId=saved.sessionId; } catch { /* no recoverable credential */ }
     }
-    await revoke();await rm(directory,{recursive:true,force:true});
-    throw new GuardHostError('Could not create a guarded conversation.');
+    try { await revoke();await rm(directory,{recursive:true,force:true}); }
+    catch(error) { throw cleanupError(error,'session_create_failed'); }
+    throw new GuardHostError('Could not create a guarded conversation.',undefined,undefined,'session_create_failed');
   }
   const guardId=sessionId;
   const hostId=randomUUID(), input=new Input(), abort=new AbortController();
   let closing=false, closed=false, busy=false, initialized=false, closeWork: Promise<void>|undefined;
   let host: ReturnType<typeof query> | undefined;
   let expiresTimer: ReturnType<typeof setTimeout> | undefined;
+  let stopReason: GuardHostErrorCode | undefined;
+  function cleanupError(error: unknown, operationCode: GuardHostErrorCode): GuardHostError {
+    if(error instanceof GuardHostError) return new GuardHostError(error.message,error.sessionId,error.credentialDirectory,error.code,operationCode);
+    return new GuardHostError('Credential cleanup did not complete. Retry cleanup.',sessionId,directory,'credential_cleanup_failed',operationCode);
+  }
   async function whileOpen<T>(work: Promise<T>): Promise<T> {
     if(abort.signal.aborted) throw new GuardHostError('Conversation closed.');
     let cancel: (()=>void) | undefined;
@@ -145,13 +162,15 @@ export async function createGuardedClaude(options: GuardedClaudeOptions): Promis
   async function close(): Promise<void> {
     if(closed) return;
     if(closeWork) return closeWork;
-    closing=true;input.close();abort.abort();clearTimeout(expiresTimer);
+    stopReason??='conversation_closed';closing=true;input.close();abort.abort();clearTimeout(expiresTimer);
     closeWork=(async()=>{
       let failure: unknown;
       try { await revoke(); } catch(error) { failure=error; }
-      try { host?.close(); } catch { failure??=new GuardHostError('Claude host cleanup did not complete. Retry close.',guardId,directory); }
+      try { host?.close(); } catch { failure??=new GuardHostError('Claude host cleanup did not complete. Retry close.',guardId,directory,'host_cleanup_failed'); }
       if(failure) throw failure;
-      await rm(directory,{recursive:true,force:true});closed=true;
+      try { await rm(directory,{recursive:true,force:true}); }
+      catch { throw new GuardHostError('Credential cleanup did not complete. Retry close.',guardId,directory,'credential_cleanup_failed'); }
+      closed=true;
     })();
     try { await closeWork; } finally { closeWork=undefined; }
   }
@@ -185,37 +204,52 @@ export async function createGuardedClaude(options: GuardedClaudeOptions): Promis
     host=query({prompt:input,options:sdkOptions});
     // Revocation on idle expiry does not wait for another prompt. Failures remain
     // observable through close(); the service independently enforces its TTL.
-    expiresTimer=setTimeout(()=>{void close().catch(()=>{});},ttl*1000);expiresTimer.unref();
-  } catch { await close();throw new GuardHostError('Claude host startup failed.'); }
+    expiresTimer=setTimeout(()=>{stopReason??='session_expired';void close().catch(()=>{});},ttl*1000);expiresTimer.unref();
+  } catch {
+    try { await close(); } catch(error) { throw cleanupError(error,'host_startup_failed'); }
+    throw new GuardHostError('Claude host startup failed.',undefined,undefined,'host_startup_failed');
+  }
   return Object.freeze({sessionId:guardId,
     async run(prompt: string,onMessage?: (message: SDKMessage)=>void|Promise<void>): Promise<SDKResultMessage> {
-      if(closing || busy) throw new GuardHostError('The conversation is closed or another turn is running.');
+      if(closing || busy) throw new GuardHostError('The conversation is closed or another turn is running.',undefined,undefined,closing?(stopReason??'conversation_closed'):'host_error');
       if(typeof prompt!=='string' || !prompt.trim() || prompt.trimStart().startsWith('/') || Buffer.byteLength(prompt)>131072)
         throw new GuardHostError('Provide a text prompt up to 128 KiB; host commands require a new conversation.');
       busy=true;
-      const timer=setTimeout(()=>{void close().catch(()=>{});},timeout);
+      let failureCode: GuardHostErrorCode = 'service_status_failed';
+      function fail(code:GuardHostErrorCode):never { failureCode=code;throw new Error(); }
+      const timer=setTimeout(()=>{stopReason??='turn_timeout';void close().catch(()=>{});},timeout);
       try {
         const state=await control(python,['service-status','--owner-file',ownerFile]);
-        if(closing || state.ok!==true || !Array.isArray(state.sessions) || !state.sessions.some(s=>s?.sessionId===guardId && s.active===true)) throw new Error();
+        if(closing || state.ok!==true || !Array.isArray(state.sessions) || !state.sessions.some(s=>s?.sessionId===guardId && s.active===true)) fail('session_inactive');
+        failureCode='host_stream_failed';
         input.send(prompt,hostId);
         while(true) {
+          failureCode='host_stream_failed';
           const next=await whileOpen(host!.next());
-          if(next.done || closing) throw new Error();
+          if(next.done || closing) fail('host_stream_ended');
           const message=next.value;
-          if('session_id' in message && message.session_id!==hostId) throw new Error();
+          if('session_id' in message && message.session_id!==hostId) fail('session_mismatch');
           if(message.type==='system' && message.subtype==='init') {
-            if(message.mcp_servers.length!==1 || message.mcp_servers[0].name!=='guarded' || message.mcp_servers[0].status!=='connected'
-              || !message.tools.length || message.tools.some(t=>!t.startsWith('mcp__guarded__'))) throw new Error();
+            if(!Array.isArray(message.mcp_servers) || message.mcp_servers.length!==1 || message.mcp_servers[0]?.name!=='guarded' || message.mcp_servers[0]?.status!=='connected') fail('guard_connection_failed');
+            if(!Array.isArray(message.tools) || !message.tools.length || message.tools.some(t=>typeof t!=='string' || !t.startsWith('mcp__guarded__'))) fail('unexpected_tools');
             initialized=true;
           }
-          if(!initialized && message.type!=='system') throw new Error();
-          if(onMessage) await whileOpen(Promise.resolve().then(()=>onMessage(message)));
+          // Error results can precede initialization. Only fixed subtype names are retained.
+          if(message.type==='result' && message.is_error) {
+            const code=message.subtype==='error_max_turns'?'host_turn_limit':message.subtype==='error_max_budget_usd'?'host_budget_limit':message.subtype==='error_max_structured_output_retries'?'host_output_retry_limit':'host_result_error';
+            fail(code);
+          }
+          if(!initialized && message.type!=='system') fail('host_not_initialized');
+          if(onMessage) { failureCode='message_callback_failed';await whileOpen(Promise.resolve().then(()=>onMessage(message))); }
           if(message.type==='result') {
-            if(message.is_error) throw new Error();
             return message;
           }
         }
-      } catch { await close();throw new GuardHostError('Guarded turn did not complete; the conversation was closed.'); }
+      } catch {
+        const code=stopReason??failureCode;
+        try { await close(); } catch(error) { throw cleanupError(error,code); }
+        throw new GuardHostError(`Guarded turn did not complete (${code}); the conversation was closed.`,undefined,undefined,code);
+      }
       finally { clearTimeout(timer);busy=false; }
     },close,
   });

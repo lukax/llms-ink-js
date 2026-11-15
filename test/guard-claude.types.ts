@@ -1,4 +1,6 @@
-import { createGuardedClaude, type GuardReview } from '../dist/guard-claude.js';
+import { createGuardedClaude, GuardHostError, type GuardHostErrorCode, type GuardReview } from '../dist/guard-claude.js';
+const code: GuardHostErrorCode = new GuardHostError('Example').code;
+void code;
 async function example() {
   const conversation = await createGuardedClaude({
     ownerFile: '/private/owner.json', python: '/venv/bin/python', cwd: '/workspace',

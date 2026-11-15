@@ -307,7 +307,7 @@ JavaScript uses a 65-second total request deadline; pass `{ signal }` to cancel 
 `llms-ink/guard/claude` binds one Claude Agent SDK conversation to one authenticated local Guard session. Install the optional peer separately:
 
 ```sh
-npm install llms-ink@0.7.0 @anthropic-ai/claude-agent-sdk@0.3.319
+npm install llms-ink@0.7.1 @anthropic-ai/claude-agent-sdk@0.3.319
 ```
 
 First [start the Python 0.10.0 local service](https://llms.ink/guard/service/) with a reviewed gateway configuration and existing Claude authentication. Then try the bundled terminal host:
@@ -330,3 +330,16 @@ The default fixed session TTL is 900 seconds (`ttl`, maximum 86400), with no ren
 Allowed results go to Claude using the host's authentication, after local inspection. The adapter does not call hosted Inspect. Other SDK entry points do not import the optional Claude dependency. [Guide](https://llms.ink/guard/claude/) · [Runnable example](examples/guard-claude.mjs).
 
 Lifecycle tests use real service sockets and subprocess effects with a simulated SDK loop. Run them with `LLMS_INK_GUARD_TEST_PYTHON=/absolute/python npm run test:guard` after installing Python `llms-ink==0.10.0`. The separately opted-in `test:guard:live` requires `LLMS_INK_CLAUDE_LIVE=1`, existing Claude authentication and the optional local model when `LLMS_INK_HOST_REAL_MODEL=1`. Scripted fixture approvals are interoperability evidence, not independent human review or proof of attack prevention.
+
+### Guard host diagnostics
+
+`GuardHostError.code` identifies the failed local check or a fixed host-reported result category. `operationCode` preserves the preceding operation when cleanup fails; the primary `code` then describes cleanup. The terminal example prints both. No raw provider error, prompt, tool output, command or credential is copied into these codes.
+
+- `service_status_failed` / `session_inactive`: check the local service with `llms-ink-guard doctor --config FILE --owner-file FILE` (Python 0.12.0). Start a new conversation after resolving it.
+- `guard_connection_failed` / `unexpected_tools` / `session_mismatch` / `host_not_initialized`: the host did not establish the expected guarded conversation. Check host compatibility and configuration; permissions are not broadened.
+- `host_stream_failed` / `host_stream_ended` / `host_startup_failed`: the host failed to start or continue. These codes do not establish a provider, authentication or network cause.
+- `host_result_error` / `host_turn_limit` / `host_budget_limit` / `host_output_retry_limit`: the host reported an error or one of its configured limits. Only known subtype names are mapped; error text is omitted.
+- `message_callback_failed`: the application output callback failed. `turn_timeout`, `session_expired` and `conversation_closed` distinguish adapter deadlines and closure.
+- `revocation_unconfirmed`, `host_cleanup_failed` or `credential_cleanup_failed`: retain the reported private directory and retry `close()` or use owner-controlled revocation. Do not treat cleanup as complete.
+
+A failed running turn closes the conversation and attempts revocation; no automatic retry or unguarded fallback occurs. Successful turns may already have performed approved actions, and an error can occur after a tool effect: these codes are not proof of non-execution. Session IDs and recovery paths remain available only for cleanup failures and should not be posted publicly. `host_error` is the fallback for argument/state errors and externally constructed errors.
