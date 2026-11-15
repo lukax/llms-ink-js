@@ -175,7 +175,7 @@ export async function createGuardedClaude(options: GuardedClaudeOptions): Promis
     try { await closeWork; } finally { closeWork=undefined; }
   }
   async function elicit(request: ElicitationRequest, context: {signal:AbortSignal}): Promise<{action:'accept'|'decline';content?:{approve:boolean}}> {
-    if(closing || !busy || context.signal.aborted || request.serverName!=='guarded' || (request.mode??'form')!=='form'
+    if(closing || !initialized || !busy || context.signal.aborted || request.serverName!=='guarded' || (request.mode??'form')!=='form'
       || typeof request.message!=='string' || Buffer.byteLength(request.message)>8192 || !sameShape(request.requestedSchema,reviewSchema)) return {action:'decline'};
     const lifetime=new AbortController();
     const cancel=():void=>lifetime.abort();
@@ -239,6 +239,10 @@ export async function createGuardedClaude(options: GuardedClaudeOptions): Promis
             const code=message.subtype==='error_max_turns'?'host_turn_limit':message.subtype==='error_max_budget_usd'?'host_budget_limit':message.subtype==='error_max_structured_output_retries'?'host_output_retry_limit':'host_result_error';
             fail(code);
           }
+          // Claude can emit subscription rate status before its initialization
+          // announcement. Discard it until the guard connection and tools are
+          // verified; it grants no authority and never reaches the callback.
+          if(!initialized && message.type==='rate_limit_event') continue;
           if(!initialized && message.type!=='system') fail('host_not_initialized');
           if(onMessage) { failureCode='message_callback_failed';await whileOpen(Promise.resolve().then(()=>onMessage(message))); }
           if(message.type==='result') {

@@ -11,6 +11,16 @@ mock.module('@anthropic-ai/claude-agent-sdk',{namedExports:{query:({prompt,optio
  const messages=(async function*(){
   if(behavior==='early-result-error'){yield{type:'result',subtype:'error_during_execution',session_id:id,is_error:true,errors:['PRIVATE host failure']};return;}
   if(behavior==='missing-init'){yield{type:'assistant',session_id:id,message:{content:[]}};return;}
+  if(behavior.startsWith('early-rate')){
+   const event={type:'rate_limit_event',session_id:behavior==='early-rate-wrong-id'?'different':id,rate_limit_info:{status:'allowed'}};
+   yield event;
+   if(behavior==='early-rate-ended')return;
+   if(behavior==='early-rate-assistant'){yield{type:'assistant',session_id:id,message:{content:[]}};return;}
+   if(behavior==='early-rate-success'){yield{type:'result',subtype:'success',session_id:id,is_error:false,result:'PRIVATE premature output'};return;}
+   if(behavior==='early-rate-stalled'){while(!options.abortController.signal.aborted){await pause(20);yield event;}return;}
+   assert.equal((await options.canUseTool('mcp__guarded__fixture__record',{})).behavior,'deny');
+   assert.deepEqual(await options.onElicitation({serverName:'guarded',message:'PRIVATE premature review',requestedSchema:{type:'object',properties:{approve:{type:'boolean',title:'Approve this call once',default:false}},required:['approve']}},{signal:options.abortController.signal}),{action:'decline'});
+  }
   connection.send({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-11-25',capabilities:{elicitation:{form:{}}}}});await connection.next();
   connection.send({jsonrpc:'2.0',method:'notifications/initialized'});
   connection.send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}});const listed=await connection.next();
@@ -51,6 +61,20 @@ test('one session across turns, new conversations isolated, close revokes and re
 });
 test('exact policy denial never invokes review or dispatches',settings,async()=>{
  const f=await fixture();let c;let reviews=0;try{c=await createGuardedClaude(opts(f,async()=>{reviews++;return true;}));await c.run('outside');assert.equal(reviews,0);assert.deepEqual(await f.effects(),[]);}finally{await c?.close();await f.close();}
+});
+test('early rate status waits for verified initialization without output, approval or tool authority',settings,async()=>{
+ const f=await fixture();let c,reviews=0;const seen=[];behavior='early-rate';
+ try{c=await createGuardedClaude(opts(f,async()=>{reviews++;return true;}));await c.run('safe',message=>seen.push(message));
+  assert.equal(seen[0].type,'system');assert.equal(seen[0].subtype,'init');assert.ok(!seen.some(message=>message.type==='rate_limit_event'));
+  assert.equal(reviews,1);assert.equal((await f.effects()).length,1);await c.close();assert.ok(!f.status().sessions.some(s=>s.active));
+ }finally{behavior='normal';await c?.close();await f.close();}
+});
+for(const [mode,code]of Object.entries({'early-rate-wrong-id':'session_mismatch','early-rate-ended':'host_stream_ended','early-rate-assistant':'host_not_initialized','early-rate-success':'host_not_initialized','early-rate-stalled':'turn_timeout'}))
+test(mode+' cannot substitute for initialization',settings,async()=>{
+ const f=await fixture();let c,reviews=0;const seen=[];behavior=mode;
+ try{c=await createGuardedClaude({...opts(f,async()=>{reviews++;return true;}),turnTimeoutMs:500});await assert.rejects(c.run('safe',message=>seen.push(message)),error=>error.code===code);
+  assert.equal(reviews,0);assert.deepEqual(seen,[]);assert.deepEqual(await f.effects(),[]);assert.ok(!f.status().sessions.some(s=>s.active));
+ }finally{behavior='normal';await c?.close();await f.close();}
 });
 test('closing with approval pending aborts the review and prevents late acceptance',settings,async()=>{
  const f=await fixture();let c,accept,seen;const reached=new Promise(r=>seen=r);let signal;

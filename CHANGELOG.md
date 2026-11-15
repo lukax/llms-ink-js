@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.2 — 2026-11-15
+
+- Handle Claude subscription rate-status events arriving before initialization. Early status is discarded; session identity, guard connection and tool inventory must still pass before use.
+- Refuse approval callbacks before initialization. Added service-backed regression cases for early status, premature output/results, mismatched identity, missing initialization and deadline cleanup.
+- The observed `rate_limit_event` ordering reproduces one startup failure. Earlier failures without message-order evidence remain unclassified. No automatic action retry or permission expansion.
+
 ## 0.7.1 — 2026-11-14
 
 - Fixed failure codes distinguish local service checks, host connection/inventory/identity, stream termination, host-reported limits, output callbacks, deadlines and session expiry without copying raw host errors.

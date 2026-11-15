@@ -1,6 +1,6 @@
 {
   "name": "llms-ink",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Turn any link — site, docs section, page, GitHub repo, PDF or video — into llms.txt and llms-full.txt. Typed client for llms.ink, plus a Vite plugin, an Astro integration and middleware that serve the files from your site, and Vercel AI SDK tools. No dependencies.",
   "type": "module",
   "exports": {
