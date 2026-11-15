@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.8.0 — 2026-11-15
+## 0.8.1 — 2026-11-15
+
+- Publish the host lifetime binding below with the exported SDK `VERSION`, npm metadata and JSR metadata aligned. The failed 0.8.0 tag remains unchanged.
+
+## 0.8.0 — not published
+
+The tag failed its existing exported-version check before publication. Its implementation is included in 0.8.1.
 
 - Require Python Guard 0.14.0+ for the optional Claude adapter. Create a host-bound session and confirm its owner watcher before starting Claude; older services are refused without an unbound fallback.
 - End session authority on observed host/watcher disconnection, including abrupt host termination. Keep fixed expiry, per-call review and non-resumable conversations; stopped processes can delay disconnect observation until expiry.

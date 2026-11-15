@@ -307,7 +307,7 @@ JavaScript uses a 65-second total request deadline; pass `{ signal }` to cancel 
 `llms-ink/guard/claude` binds one Claude Agent SDK conversation to one authenticated local Guard session. Install the optional peer separately:
 
 ```sh
-npm install llms-ink@0.8.0 @anthropic-ai/claude-agent-sdk@0.3.319
+npm install llms-ink@0.8.1 @anthropic-ai/claude-agent-sdk@0.3.319
 ```
 
 First [start the Python 0.14.0 local service](https://llms.ink/guard/service/) with a reviewed gateway configuration and existing Claude authentication. Then try the bundled terminal host:
