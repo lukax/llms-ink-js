@@ -1,15 +1,21 @@
 {
   "name": "@lukax/llms-ink",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "license": "MIT",
   "exports": {
     ".": "./src/index.ts",
     "./vite": "./src/vite.ts",
     "./astro": "./src/astro.ts",
     "./middleware": "./src/middleware.ts",
-    "./ai": "./src/ai.ts"
+    "./ai": "./src/ai.ts",
+    "./guard/claude": "./src/guard-claude.ts"
   },
   "publish": {
-    "include": ["src/*.ts", "README.md", "LICENSE", "jsr.json"]
+    "include": [
+      "src/*.ts",
+      "README.md",
+      "LICENSE",
+      "jsr.json"
+    ]
   }
 }

@@ -1,0 +1,222 @@
+/** Node/POSIX host integration for explicitly scoped Claude Agent SDK conversations. */
+import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, chmod, lstat, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
+import { query, type ElicitationRequest, type Options, type SDKMessage, type SDKResultMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+
+export interface GuardReview {
+  /** Complete guard-authored review, including command, arguments and policy/definition hashes. Render as plain text. */
+  message: string;
+  /** Stop displaying the form when this signal aborts. Never reuse a decision. */
+  signal: AbortSignal;
+}
+export interface GuardedClaudeOptions {
+  /** Private owner credential. This path is used by the control process, never sent to Claude. */
+  ownerFile: string;
+  /** Absolute Python interpreter with llms-ink[guard] 0.10.0 installed. */
+  python: string;
+  /** Called for each fresh approval. Only literal true accepts. Errors, cancellation and timeout decline. */
+  review: (request: GuardReview) => Promise<boolean>;
+  cwd: string;
+  model?: string;
+  /** Optional absolute path to a supported Claude Code executable. */
+  claudeExecutable?: string;
+  /** Fixed lifetime, 1–86400 seconds. Default 900. No automatic renewal. */
+  ttl?: number;
+  /** Per-turn deadline, including reviews. Default 120000, maximum 600000. */
+  turnTimeoutMs?: number;
+  maxTurns?: number;
+  maxBudgetUsd?: number;
+}
+export interface GuardedClaudeConversation {
+  /** Non-secret guard session ID, distinct from Claude's conversation UUID. */
+  readonly sessionId: string;
+  /** Run one turn. Calls must be sequential; callbacks receive host output, never owner credentials. */
+  run(prompt: string, onMessage?: (message: SDKMessage) => void | Promise<void>): Promise<SDKResultMessage>;
+  /** Revoke authority and close the host. Idempotent after confirmed cleanup; retry on cleanup errors. */
+  close(): Promise<void>;
+}
+export class GuardHostError extends Error {
+  readonly sessionId: string | undefined;
+  readonly credentialDirectory: string | undefined;
+  constructor(message: string, sessionId?: string, credentialDirectory?: string) {
+    super(message); this.name = 'GuardHostError'; this.sessionId = sessionId; this.credentialDirectory = credentialDirectory;
+  }
+}
+
+const idPattern = /^[a-f0-9]{32}$/;
+const reviewSchema = {type:'object',properties:{approve:{type:'boolean',title:'Approve this call once',default:false}},required:['approve']};
+function sameShape(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+  const ak=Object.keys(a), bk=Object.keys(b);
+  return ak.length===bk.length && ak.every(k=>Object.hasOwn(b,k) && sameShape((a as Record<string,unknown>)[k],(b as Record<string,unknown>)[k]));
+}
+function control(python: string, args: string[]): Promise<Record<string, unknown>> {
+  return new Promise((resolve,reject)=>execFile(python,['-m','llms_ink.guard',...args],{timeout:30000,maxBuffer:16384,encoding:'utf8'},(error,stdout)=>{
+    if(error) { reject(new GuardHostError('Guard control did not complete.')); return; }
+    try {
+      const value: unknown=JSON.parse(stdout);
+      if(!value || typeof value!=='object' || Array.isArray(value)) throw new Error();
+      resolve(value as Record<string,unknown>);
+    } catch { reject(new GuardHostError('Guard control returned an invalid response.')); }
+  }));
+}
+class Input implements AsyncIterable<SDKUserMessage> {
+  private pending: SDKUserMessage | undefined;
+  private wake: (()=>void) | undefined;
+  private ended = false;
+  send(prompt: string, session: string): void {
+    if(this.ended || this.pending) throw new GuardHostError('Conversation input is unavailable.');
+    this.pending={type:'user',session_id:session,message:{role:'user',content:prompt},parent_tool_use_id:null};
+    this.wake?.();
+  }
+  close(): void { this.ended=true; this.wake?.(); }
+  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
+    while(!this.ended) {
+      if(!this.pending) await new Promise<void>(resolve=>{this.wake=resolve;});
+      this.wake=undefined;
+      if(this.ended) return;
+      const next=this.pending;this.pending=undefined;
+      if(next) yield next;
+    }
+  }
+}
+
+/**
+ * Create one non-resumable, tool-scoped conversation. New conversations require new instances.
+ * The owner process, SDK and review callback are trusted. This is not an OS sandbox.
+ * A process crash leaves authority bounded by the fixed TTL; there is no crash-proof lease or exposure ledger.
+ */
+export async function createGuardedClaude(options: GuardedClaudeOptions): Promise<GuardedClaudeConversation> {
+  options={...options};
+  if(process.platform==='win32') throw new GuardHostError('Guard sessions require macOS or Linux.');
+  const {python,ownerFile,review,cwd,claudeExecutable}=options;
+  const ttl=options.ttl??900, timeout=options.turnTimeoutMs??120000;
+  if(!isAbsolute(python) || !isAbsolute(ownerFile) || !isAbsolute(cwd) || (claudeExecutable && !isAbsolute(claudeExecutable)) || typeof review!=='function'
+    || !Number.isInteger(ttl) || ttl<1 || ttl>86400 || !Number.isInteger(timeout) || timeout<1 || timeout>600000
+    || (options.maxTurns!==undefined && (!Number.isInteger(options.maxTurns) || options.maxTurns<1 || options.maxTurns>100))
+    || (options.maxBudgetUsd!==undefined && (!Number.isFinite(options.maxBudgetUsd) || options.maxBudgetUsd<=0)))
+    throw new GuardHostError('Absolute paths, a review callback and bounded lifetimes are required.');
+  const directory=await mkdtemp(join(tmpdir(),'ink-host-'));await chmod(directory,0o700);
+  const file=join(directory,'session.json');
+  let sessionId: string | undefined;
+  async function revoke(): Promise<void> {
+    if(!sessionId) return;
+    try { const result=await control(python,['session-revoke','--owner-file',ownerFile,'--session-id',sessionId]); if(result.ok!==true) throw new Error(); }
+    catch {
+      try {
+        const state=await control(python,['service-status','--owner-file',ownerFile]);
+        if(state.ok!==true || !Array.isArray(state.sessions) || state.sessions.some(s=>!s || typeof s!=='object' || typeof s.sessionId!=='string' || (s.sessionId===sessionId && s.active!==false))) throw new Error();
+      } catch { throw new GuardHostError('Session revocation could not be confirmed. Keep the credential directory and retry close or revoke it with the owner CLI.',sessionId,directory); }
+    }
+  }
+  try {
+    const result=await control(python,['session-create','--owner-file',ownerFile,'--output',file,'--ttl',String(ttl)]);
+    if(typeof result.sessionId!=='string' || !idPattern.test(result.sessionId)) throw new Error();
+    sessionId=result.sessionId;
+    const info=await lstat(file);
+    if(!info.isFile() || info.isSymbolicLink() || (info.mode&0o077)!==0 || info.uid!==process.getuid?.()) throw new Error();
+  } catch {
+    // A terminated CLI may have written a capability before printing its ID.
+    if(!sessionId) {
+      try { const saved=JSON.parse(await readFile(file,'utf8')); if(typeof saved.sessionId==='string' && idPattern.test(saved.sessionId)) sessionId=saved.sessionId; } catch { /* no recoverable credential */ }
+    }
+    await revoke();await rm(directory,{recursive:true,force:true});
+    throw new GuardHostError('Could not create a guarded conversation.');
+  }
+  const guardId=sessionId;
+  const hostId=randomUUID(), input=new Input(), abort=new AbortController();
+  let closing=false, closed=false, busy=false, initialized=false, closeWork: Promise<void>|undefined;
+  let host: ReturnType<typeof query> | undefined;
+  let expiresTimer: ReturnType<typeof setTimeout> | undefined;
+  async function whileOpen<T>(work: Promise<T>): Promise<T> {
+    if(abort.signal.aborted) throw new GuardHostError('Conversation closed.');
+    let cancel: (()=>void) | undefined;
+    try {
+      return await Promise.race([work,new Promise<never>((_,reject)=>{
+        cancel=()=>reject(new GuardHostError('Conversation closed.'));
+        abort.signal.addEventListener('abort',cancel,{once:true});
+      })]);
+    } finally { if(cancel) abort.signal.removeEventListener('abort',cancel); }
+  }
+  async function close(): Promise<void> {
+    if(closed) return;
+    if(closeWork) return closeWork;
+    closing=true;input.close();abort.abort();clearTimeout(expiresTimer);
+    closeWork=(async()=>{
+      let failure: unknown;
+      try { await revoke(); } catch(error) { failure=error; }
+      try { host?.close(); } catch { failure??=new GuardHostError('Claude host cleanup did not complete. Retry close.',guardId,directory); }
+      if(failure) throw failure;
+      await rm(directory,{recursive:true,force:true});closed=true;
+    })();
+    try { await closeWork; } finally { closeWork=undefined; }
+  }
+  async function elicit(request: ElicitationRequest, context: {signal:AbortSignal}): Promise<{action:'accept'|'decline';content?:{approve:boolean}}> {
+    if(closing || !busy || context.signal.aborted || request.serverName!=='guarded' || (request.mode??'form')!=='form'
+      || typeof request.message!=='string' || Buffer.byteLength(request.message)>8192 || !sameShape(request.requestedSchema,reviewSchema)) return {action:'decline'};
+    const lifetime=new AbortController();
+    const cancel=():void=>lifetime.abort();
+    abort.signal.addEventListener('abort',cancel,{once:true});context.signal.addEventListener('abort',cancel,{once:true});
+    const timer=setTimeout(cancel,55000);
+    try {
+      const answer=await Promise.race([
+        Promise.resolve().then(()=>review(Object.freeze({message:request.message,signal:lifetime.signal}))),
+        new Promise<false>(resolve=>lifetime.signal.addEventListener('abort',()=>resolve(false),{once:true})),
+      ]);
+      return answer===true && !lifetime.signal.aborted && !closing ? {action:'accept',content:{approve:true}} : {action:'decline'};
+    } catch { return {action:'decline'}; }
+    finally { clearTimeout(timer);cancel();abort.signal.removeEventListener('abort',cancel);context.signal.removeEventListener('abort',cancel); }
+  }
+  try {
+    const sdkOptions: Options={
+      abortController:abort,sessionId:hostId,persistSession:false,settingSources:[],plugins:[],tools:[],
+      strictMcpConfig:true,mcpServers:{guarded:{command:python,args:['-m','llms_ink.guard','connect','--session-file',file]}},
+      canUseTool:async name=>name.startsWith('mcp__guarded__') && initialized && busy && !closing
+        ? {behavior:'allow'} : {behavior:'deny',message:'Only guarded tools are available.'},
+      settings:{disableAllHooks:true,disableClaudeAiConnectors:true,disabledMcpServers:['claude-in-chrome']},
+      extraArgs:{'disable-slash-commands':null,'no-chrome':null},
+      cwd,model:options.model,pathToClaudeCodeExecutable:claudeExecutable,
+      maxTurns:options.maxTurns??12,maxBudgetUsd:options.maxBudgetUsd??1,onElicitation:elicit,
+    };
+    host=query({prompt:input,options:sdkOptions});
+    // Revocation on idle expiry does not wait for another prompt. Failures remain
+    // observable through close(); the service independently enforces its TTL.
+    expiresTimer=setTimeout(()=>{void close().catch(()=>{});},ttl*1000);expiresTimer.unref();
+  } catch { await close();throw new GuardHostError('Claude host startup failed.'); }
+  return Object.freeze({sessionId:guardId,
+    async run(prompt: string,onMessage?: (message: SDKMessage)=>void|Promise<void>): Promise<SDKResultMessage> {
+      if(closing || busy) throw new GuardHostError('The conversation is closed or another turn is running.');
+      if(typeof prompt!=='string' || !prompt.trim() || prompt.trimStart().startsWith('/') || Buffer.byteLength(prompt)>131072)
+        throw new GuardHostError('Provide a text prompt up to 128 KiB; host commands require a new conversation.');
+      busy=true;
+      const timer=setTimeout(()=>{void close().catch(()=>{});},timeout);
+      try {
+        const state=await control(python,['service-status','--owner-file',ownerFile]);
+        if(closing || state.ok!==true || !Array.isArray(state.sessions) || !state.sessions.some(s=>s?.sessionId===guardId && s.active===true)) throw new Error();
+        input.send(prompt,hostId);
+        while(true) {
+          const next=await whileOpen(host!.next());
+          if(next.done || closing) throw new Error();
+          const message=next.value;
+          if('session_id' in message && message.session_id!==hostId) throw new Error();
+          if(message.type==='system' && message.subtype==='init') {
+            if(message.mcp_servers.length!==1 || message.mcp_servers[0].name!=='guarded' || message.mcp_servers[0].status!=='connected'
+              || !message.tools.length || message.tools.some(t=>!t.startsWith('mcp__guarded__'))) throw new Error();
+            initialized=true;
+          }
+          if(!initialized && message.type!=='system') throw new Error();
+          if(onMessage) await whileOpen(Promise.resolve().then(()=>onMessage(message)));
+          if(message.type==='result') {
+            if(message.is_error) throw new Error();
+            return message;
+          }
+        }
+      } catch { await close();throw new GuardHostError('Guarded turn did not complete; the conversation was closed.'); }
+      finally { clearTimeout(timer);busy=false; }
+    },close,
+  });
+}

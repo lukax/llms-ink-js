@@ -1,6 +1,6 @@
 {
   "name": "llms-ink",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Turn any link — site, docs section, page, GitHub repo, PDF or video — into llms.txt and llms-full.txt. Typed client for llms.ink, plus a Vite plugin, an Astro integration and middleware that serve the files from your site, and Vercel AI SDK tools. No dependencies.",
   "type": "module",
   "exports": {
@@ -23,24 +23,55 @@
     "./ai": {
       "types": "./dist/ai.d.ts",
       "default": "./dist/ai.js"
+    },
+    "./guard/claude": {
+      "types": "./dist/guard-claude.d.ts",
+      "default": "./dist/guard-claude.js"
     }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist",
+    "examples/guard-claude.mjs"
+  ],
   "sideEffects": false,
-  "repository": { "type": "git", "url": "git+https://github.com/lukax/llms-ink-js.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukax/llms-ink-js.git"
+  },
   "bugs": "https://github.com/lukax/llms-ink-js/issues",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "prepublishOnly": "npm run build && npm test",
     "test": "npm run build && tsc -p test/tsconfig.json && node --test test/client.test.mjs test/plugins.test.mjs test/middleware.test.mjs test/traffic.test.mjs test/inspect.test.mjs test/ai.test.mjs",
     "test:live": "npm run build && node --test test/live.test.mjs",
     "test:bun": "npm run build && bun test ./test/client.test.mjs ./test/plugins.test.mjs ./test/middleware.test.mjs ./test/traffic.test.mjs ./test/inspect.test.mjs ./test/ai.test.mjs",
-    "test:bun:live": "npm run build && bun test --timeout 300000 ./test/live.test.mjs"
+    "test:bun:live": "npm run build && bun test --timeout 300000 ./test/live.test.mjs",
+    "test:guard": "node --experimental-test-module-mocks --test test/guard-claude.test.mjs",
+    "test:guard:live": "node --test test/guard-claude-live.test.mjs"
   },
-  "keywords": ["llms.txt", "llms-full.txt", "llm", "ai", "markdown", "docs", "context", "rag", "sdk", "llms-ink", "vite-plugin", "astro-integration", "middleware", "ai-sdk", "vercel-ai-sdk", "tools"],
+  "keywords": [
+    "llms.txt",
+    "llms-full.txt",
+    "llm",
+    "ai",
+    "markdown",
+    "docs",
+    "context",
+    "rag",
+    "sdk",
+    "llms-ink",
+    "vite-plugin",
+    "astro-integration",
+    "middleware",
+    "ai-sdk",
+    "vercel-ai-sdk",
+    "tools"
+  ],
   "homepage": "https://llms.ink/docs/",
   "author": "Lucas Espindola (https://lucasespindola.com)",
   "license": "MIT",
@@ -48,15 +79,28 @@
     "ai": ">=5",
     "astro": ">=4",
     "vite": ">=5",
-    "zod": "^3.25.76 || ^4.1.8"
+    "zod": "^3.25.76 || ^4.1.8",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.319"
   },
   "peerDependenciesMeta": {
-    "ai": { "optional": true },
-    "astro": { "optional": true },
-    "vite": { "optional": true },
-    "zod": { "optional": true }
+    "ai": {
+      "optional": true
+    },
+    "astro": {
+      "optional": true
+    },
+    "vite": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    },
+    "@anthropic-ai/claude-agent-sdk": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.319",
     "@types/node": "^22.20.5",
     "ai": "^7.0.164",
     "astro": "^7.4.7",

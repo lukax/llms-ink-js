@@ -3,11 +3,19 @@
     "target": "ES2022",
     "module": "ES2022",
     "moduleResolution": "Bundler",
-    "lib": ["ES2022", "DOM"],
-    "types": ["node"],
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["ai.types.ts"]
+  "include": [
+    "ai.types.ts",
+    "guard-claude.types.ts"
+  ]
 }

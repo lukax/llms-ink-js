@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0 — 2026-11-14
+
+- Optional Node/POSIX `llms-ink/guard/claude` host adapter: one authenticated local Guard session per non-resumable Claude SDK conversation, shared across sequential turns and revoked on close.
+- Explicit application review callbacks, bounded review/turn/session lifetimes, strict guarded tool scope, cancellation and recoverable cleanup failures. Includes an interactive terminal example.
+- Service-backed lifecycle tests and an opt-in real Claude SDK/local-model test. Requires Python Guard 0.10.0; the base client and hosted receipt contract are unchanged.
+
 ## 0.6.0
 
 - `llms-ink/ai`: `llmsInkTools({ client?, maxChars?, include? })`, Vercel AI SDK tools (`llmsTxt`, `llmsFullTxt`,

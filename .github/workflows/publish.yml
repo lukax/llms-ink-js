@@ -26,6 +26,12 @@ jobs:
           test "v$(node -p "require('./jsr.json').version")" = "$GITHUB_REF_NAME"
       - run: npm ci
       - run: npm test
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install llms-ink==0.10.0
+      - name: Guard host lifecycle and local subprocess tests
+        run: LLMS_INK_GUARD_TEST_PYTHON="$(command -v python)" npm run test:guard
       - name: npm
         run: |
           if npm view "llms-ink@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "npm already has ${GITHUB_REF_NAME#v}"; else npm publish --provenance --access public; fi

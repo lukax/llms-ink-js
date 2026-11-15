@@ -301,3 +301,32 @@ Requests are limited to 128 KiB after JSON encoding and responses to 16 KiB. The
 For JSON, serialize it yourself and pass the resulting string to `inspect()`. The SDK sends `format: "text"`, so its digest covers those exact bytes; it does not promise cross-language JSON canonicalization. See [pilot limits and privacy](https://llms.ink/inspect/).
 
 JavaScript uses a 65-second total request deadline; pass `{ signal }` to cancel earlier.
+
+## Claude conversation guard (experimental, Node / POSIX)
+
+`llms-ink/guard/claude` binds one Claude Agent SDK conversation to one authenticated local Guard session. Install the optional peer separately:
+
+```sh
+npm install llms-ink@0.7.0 @anthropic-ai/claude-agent-sdk@0.3.319
+```
+
+First [start the Python 0.10.0 local service](https://llms.ink/guard/service/) with a reviewed gateway configuration and existing Claude authentication. Then try the bundled terminal host:
+
+```sh
+node node_modules/llms-ink/examples/guard-claude.mjs \
+  --owner-file /private/guard/owner.json \
+  --python /absolute/path/to/.venv/bin/python \
+  --cwd /absolute/path/to/workspace
+```
+
+It requires an interactive terminal and displays the complete review for each permitted action. Type `approve` to send that call once; Enter declines. `/exit`, terminal close and handled termination revoke the session. The example escapes terminal control characters rather than interpreting them. `--model` and `--claude-executable` are optional.
+
+For application hosts, import `createGuardedClaude` and pass absolute `ownerFile`, `python` and `cwd` paths plus `review: async ({message, signal}) => boolean`. Render `message` completely as plain text; abort the UI on `signal`. Only a fresh literal `true` accepts. The returned object exposes the non-secret `sessionId`, sequential `run(prompt, onMessage?)` and `close()`. Always await close in a finally block. Create a new instance for each independent conversation; there is no resume/fork interface. The owner file never enters the SDK's MCP configuration.
+
+The default fixed session TTL is 900 seconds (`ttl`, maximum 86400), with no renewal. Each turn has a 120000 ms deadline (`turnTimeoutMs`, maximum 600000). Reviews stop after 55 seconds. The adapter configures no native tools, other MCP connections, plugins or local hooks. SDK `maxTurns` defaults to 12 and `maxBudgetUsd` to 1; SDK cost estimates are not a hard billing limit. Optional `model` and `claudeExecutable` select the host model/binary.
+
+`GuardHostError` reports incomplete cleanup with `sessionId` and `credentialDirectory`. If revocation cannot be confirmed, the private credential file remains for recovery; retry `close()` or revoke through the owner CLI. A host process killed without cleanup can leave authority until the service's TTL. The owner process, SDK and approval UI are trusted; private files do not isolate malicious same-user code. This is not a process sandbox, exposure ledger or automatic desktop plugin. Compaction does not establish clean context.
+
+Allowed results go to Claude using the host's authentication, after local inspection. The adapter does not call hosted Inspect. Other SDK entry points do not import the optional Claude dependency. [Guide](https://llms.ink/guard/claude/) · [Runnable example](examples/guard-claude.mjs).
+
+Lifecycle tests use real service sockets and subprocess effects with a simulated SDK loop. Run them with `LLMS_INK_GUARD_TEST_PYTHON=/absolute/python npm run test:guard` after installing Python `llms-ink==0.10.0`. The separately opted-in `test:guard:live` requires `LLMS_INK_CLAUDE_LIVE=1`, existing Claude authentication and the optional local model when `LLMS_INK_HOST_REAL_MODEL=1`. Scripted fixture approvals are interoperability evidence, not independent human review or proof of attack prevention.
