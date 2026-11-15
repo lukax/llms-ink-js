@@ -179,7 +179,7 @@ not, per path and agent in memory, and every `flushEvery` seconds (default 60, a
 leaves your server: no IPs, user agents, query strings or cookies; browsers aren't counted. Sends never block a
 response: with `ctx` they go to `ctx.waitUntil`, without one (Node, Bun, Deno) an unref'd timer sends. Failed sends
 keep their counts and retry with backoff (honoring `Retry-After`); a `401` or `403 site_claimed` stops counting with
-one warning. `site` defaults to the middleware's hostname; the first key to send for a site owns it. Counts not yet
+one warning. `site` defaults to the middleware's hostname; verify the exact hostname at [llms.ink/traffic](https://llms.ink/traffic/) before enabling it. Restart the middleware after verification if it already stopped on 403. Counts not yet
 sent are lost when the process stops: call `await llms.flush()` on shutdown. Read them at
 [llms.ink/traffic](https://llms.ink/traffic/) or `GET /api/v0/traffic?site=&days=` with the same key.
 `classifyAgent(userAgent)` and `trafficCounter({ key, site })` (`record(request, ctx?)`, `flush()`) are exported for

@@ -67,7 +67,7 @@ export function classifyAgent(userAgent: string | null | undefined): AiAgent | n
 
 /** Options for {@link trafficCounter}, and the middleware's `traffic` option. */
 export interface TrafficOptions {
-  /** API key (`lk_…`). The first key to send counts for a site owns it; read them back with the same key. */
+  /** API key (`lk_…`). Verify the hostname at llms.ink/traffic first; account keys share verified sites. */
   key: string;
   /** Hostname the counts are filed under, e.g. `example.com`. The middleware defaults it to its `site`. */
   site?: string;
