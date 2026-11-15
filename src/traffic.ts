@@ -103,7 +103,7 @@ export interface TrafficCounter {
    * to `ctx.waitUntil`; without `ctx`, a background timer sends. Never throws and never waits.
    */
   record(request: Request, ctx?: WaitUntil): void;
-  /** Sends everything counted so far. Never rejects; failed sends are kept and retried with backoff. */
+  /** Sends everything counted so far. Never rejects; transient failures retry the unchanged batch for up to 24 hours. Counts remain in memory only. */
   flush(): Promise<void>;
 }
 
@@ -116,6 +116,8 @@ const OTHER_PATH = '/(other)';
 const MAX_PATH = 512;
 const MAX_BACKOFF_MS = 3_600_000;
 const SEND_TIMEOUT_MS = 10_000;
+const RETRY_LIFETIME_MS = 86_400_000;
+type OutboundBatch = { body: string; id: string; expires: number };
 
 /** The path only: no query string or fragment (URL.pathname has neither), capped in length. */
 function cleanPath(url: string): string {
@@ -138,6 +140,7 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
 
   /** `period\tpath\tagent` → row. */
   const pending = new Map<string, TrafficRow & { period: string }>();
+  let queued: OutboundBatch[] = [];
   let lastSend = Date.now();
   let retryAt = 0;
   let backoff = 0;
@@ -161,21 +164,21 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
   function stop(message: string) {
     stopped = true;
     pending.clear();
+    queued = [];
     clearTimeout(timer);
     console.warn(`llms-ink traffic: ${message} Counting stopped.`);
   }
 
-  function retryLater(rows: (TrafficRow & { period: string })[], retryAfter: number | null) {
-    for (const r of rows) add(r.period, r.path, r.agent, r.kind, r.count);
+  function retryLater(retryAfter: number | null) {
     backoff = Math.min(MAX_BACKOFF_MS, Math.max(every, backoff * 2));
     retryAt = Date.now() + Math.max(backoff, (retryAfter ?? 0) * 1000);
   }
 
   /** One POST; resolves to what to do with its rows. */
-  async function send(batch: TrafficBatch): Promise<'sent' | 'drop' | 'stop' | { retryAfter: number | null }> {
+  async function send(batch: OutboundBatch): Promise<'sent' | 'drop' | 'stop' | { retryAfter: number | null }> {
     let res: Response;
     try {
-      res = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(batch), signal: AbortSignal.timeout(SEND_TIMEOUT_MS) });
+      res = await fetch(endpoint, { method: 'POST', headers: { ...headers, 'idempotency-key': batch.id }, body: batch.body, signal: AbortSignal.timeout(SEND_TIMEOUT_MS) });
     } catch {
       return { retryAfter: null };
     }
@@ -195,42 +198,51 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
     return 'drop';
   }
 
-  async function sendAll(rows: (TrafficRow & { period: string })[]) {
-    const batches: { batch: TrafficBatch; rows: typeof rows }[] = [];
-    const byPeriod = new Map<string, typeof rows>();
-    for (const r of rows) byPeriod.set(r.period, [...(byPeriod.get(r.period) ?? []), r]);
-    for (const [period, list] of byPeriod) {
-      for (let i = 0; i < list.length; i += ROWS_PER_POST) {
-        const chunk = list.slice(i, i + ROWS_PER_POST);
-        batches.push({ batch: { site, period, rows: chunk.map(({ path, agent, kind, count }) => ({ path, agent, kind, count })) }, rows: chunk });
+  /** A queued body and identifier never change, including after a partial multi-batch send. */
+  async function sendQueued(): Promise<boolean> {
+    while (queued.length) {
+      const batch = queued[0]!;
+      if (Date.now() >= batch.expires) {
+        console.warn(`llms-ink traffic: retry expired for ${site}; discarded an unconfirmed batch. Its earlier attempt may have succeeded.`);
+        queued.shift(); continue;
       }
+      const outcome = await send(batch);
+      if (outcome === 'stop') return false;
+      if (typeof outcome === 'object') { retryLater(outcome.retryAfter); return false; }
+      queued.shift();
     }
-    for (let i = 0; i < batches.length; i++) {
-      const outcome = await send(batches[i]!.batch);
-      if (outcome === 'stop') return;
-      if (typeof outcome === 'object') {
-        retryLater(batches.slice(i).flatMap((b) => b.rows), outcome.retryAfter);
-        return;
-      }
-    }
-    backoff = 0;
-    retryAt = 0;
+    backoff = 0; retryAt = 0;
+    return true;
   }
 
-  /** Waits for a send in flight, then sends what was counted meanwhile. */
+  async function drain(): Promise<void> {
+    if (!(await sendQueued()) || stopped || !pending.size) return;
+    const crypto = globalThis.crypto ?? (await import('node:crypto')).webcrypto;
+    const expires = Date.now() + RETRY_LIFETIME_MS;
+    const byPeriod = new Map<string, TrafficRow[]>();
+    for (const { period, path, agent, kind, count } of pending.values()) {
+      let rows = byPeriod.get(period); if (!rows) { rows = []; byPeriod.set(period, rows); }
+      rows.push({ path, agent, kind, count });
+    }
+    const batches: OutboundBatch[] = [];
+    for (const [period, rows] of byPeriod) for (let i = 0; i < rows.length; i += ROWS_PER_POST) {
+      const nonce = [...crypto.getRandomValues(new Uint8Array(16))].map(x => x.toString(16).padStart(2, '0')).join('');
+      batches.push({ body: JSON.stringify({ site, period, rows: rows.slice(i, i + ROWS_PER_POST) }), id: `ink-traffic-v1.${expires}.${nonce}`, expires });
+    }
+    pending.clear(); queued = batches;
+    await sendQueued();
+  }
+
+  /** Pending new counts stay separate while the previous snapshot is waiting to retry. */
   async function flush(): Promise<void> {
     while (inflight) await inflight;
-    if (!pending.size || stopped) return;
-    clearTimeout(timer);
-    timer = undefined;
-    const rows = [...pending.values()];
-    pending.clear();
-    lastSend = Date.now();
-    inflight = sendAll(rows)
-      .catch(() => {})
+    if ((!pending.size && !queued.length) || stopped) return;
+    clearTimeout(timer); timer = undefined; lastSend = Date.now();
+    inflight = drain()
+      .catch(() => { retryLater(null); })
       .finally(() => {
         inflight = null;
-        if (pending.size && !stopped) arm();
+        if ((pending.size || queued.length) && !stopped) arm();
       });
     await inflight;
   }

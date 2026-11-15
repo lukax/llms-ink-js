@@ -7,7 +7,8 @@ import { AI_AGENTS, classifyAgent, trafficCounter, llmsInkHandler, llmsInkExpres
 import { VERSION } from '../dist/index.js';
 
 /** How the stub answers POST /api/v0/traffic. */
-const stub = { mode: 'ok', delay: 0 };
+const stub = { mode: 'ok', delay: 0, loseAt: 0 };
+const accepted = new Map();
 /** Every traffic POST: { headers, raw, body }. */
 const posts = [];
 const server = createServer((req, res) => {
@@ -21,6 +22,11 @@ const server = createServer((req, res) => {
   req.on('end', () => {
     if (stub.mode === 'reset') return req.socket.destroy();
     posts.push({ headers: req.headers, raw, body: JSON.parse(raw) });
+    if (stub.mode === 'dedupe') {
+      const id = req.headers['idempotency-key']; assert.match(id, /^ink-traffic-v1\.\d{13}\.[a-f0-9]{32}$/);
+      if (accepted.has(id)) assert.equal(accepted.get(id), raw); else accepted.set(id, raw);
+      if (posts.length === stub.loseAt) return req.socket.destroy();
+    }
     const problem = (status, code, extra = {}) => {
       res.writeHead(status, { 'content-type': 'application/problem+json', ...extra });
       res.end(JSON.stringify({ type: 'x', title: 't', status, code, detail: `stub ${code}` }));
@@ -75,7 +81,7 @@ async function warnings(fn) {
   return lines;
 }
 const req = (path, ua, init = {}) => new Request(`https://example.com${path}`, { ...init, headers: { 'user-agent': ua, ...init.headers } });
-const reset = () => { stub.mode = 'ok'; stub.delay = 0; posts.length = 0; };
+const reset = () => { stub.mode = 'ok'; stub.delay = 0; stub.loseAt = 0; posts.length = 0; accepted.clear(); };
 const today = () => new Date(Date.now()).toISOString().slice(0, 10);
 const sorted = (rows) => [...rows].sort((a, b) => (a.path + a.agent).localeCompare(b.path + b.agent));
 
@@ -182,7 +188,7 @@ test('without ctx (Node, Bun): an unref\'d timer sends at flushEvery', async () 
   assert.deepEqual(posts[0].body.rows, [{ path: '/x', agent: 'PerplexityBot', kind: 'crawler', count: 2 }]);
 });
 
-test('backoff: a failed send keeps its counts, waits (honoring Retry-After), then sends them merged', async () => {
+test('backoff: retries retain their identifier and body; new counts are sent separately', async () => {
   reset();
   stub.mode = 'busy';
   const counter = trafficCounter({ key: KEY, site: 'example.com', flushEvery: 10, baseUrl });
@@ -196,8 +202,11 @@ test('backoff: a failed send keeps its counts, waits (honoring Retry-After), the
   assert.equal(kept.length, 1, 'still backing off (Retry-After: 120)');
   await shifted(140_000, async () => { counter.record(req('/r', UA.gptbot), ctx); await Promise.all(kept); });
   assert.equal(kept.length, 2);
-  assert.equal(posts.length, 2);
-  assert.deepEqual(posts[1].body.rows, [{ path: '/r', agent: 'GPTBot', kind: 'crawler', count: 4 }], 'the failed counts plus the new ones');
+  assert.equal(posts.length, 3);
+  assert.equal(posts[1].raw, posts[0].raw);
+  assert.equal(posts[1].headers['idempotency-key'], posts[0].headers['idempotency-key']);
+  assert.notEqual(posts[2].headers['idempotency-key'], posts[0].headers['idempotency-key']);
+  assert.deepEqual(posts[2].body.rows, [{ path: '/r', agent: 'GPTBot', kind: 'crawler', count: 2 }], 'new counts stay separate from the unchanged retry');
 });
 
 test('a network failure never throws and keeps the counts', async () => {
@@ -329,4 +338,31 @@ test('Express: llmsInkExpress counts requests from a real Node server and flush(
     app.closeAllConnections();
     app.close();
   }
+});
+
+
+test('an accepted batch with a lost response retries unchanged without adding counts twice', async () => {
+ reset();stub.mode='dedupe';stub.loseAt=1;
+ const counter=trafficCounter({key:KEY,site:'example.com',baseUrl});
+ counter.record(req('/once',UA.gptbot));await counter.flush();
+ counter.record(req('/new',UA.gptbot));await counter.flush();
+ assert.equal(posts.length,3);assert.equal(accepted.size,2);
+ assert.equal(posts[0].raw,posts[1].raw);assert.equal(posts[0].headers['idempotency-key'],posts[1].headers['idempotency-key']);
+ assert.equal([...accepted.values()].flatMap(v=>JSON.parse(v).rows).reduce((n,r)=>n+r.count,0),2);
+});
+test('a partial multi-batch failure preserves the failed and unsent chunks while keeping new counts separate', async () => {
+ reset();stub.mode='dedupe';stub.loseAt=2;
+ const counter=trafficCounter({key:KEY,site:'example.com',baseUrl});
+ for(let i=0;i<2500;i++)counter.record(req('/many/'+i,UA.gptbot));
+ await counter.flush();counter.record(req('/later',UA.gptbot));await counter.flush();
+ const rows=[...accepted.values()].flatMap(v=>JSON.parse(v).rows);
+ assert.equal(rows.reduce((n,r)=>n+r.count,0),2501);assert.equal(new Set(rows.map(r=>r.path)).size,2501);
+ assert.ok(posts.some((p,i)=>posts.findIndex(q=>q.headers['idempotency-key']===p.headers['idempotency-key'])!==i));
+});
+test('expired uncertain batches are discarded with a warning; new counts use a new identifier', async () => {
+ reset();stub.mode='busy';const counter=trafficCounter({key:KEY,site:'example.com',baseUrl});
+ counter.record(req('/old',UA.gptbot));await counter.flush();const old=posts[0].headers['idempotency-key'];stub.mode='ok';
+ const lines=await warnings(()=>shifted(86400001,async()=>{counter.record(req('/new',UA.gptbot));await counter.flush();}));
+ assert.match(lines.join(' '),/retry expired/);assert.equal(posts.filter(p=>p.headers['idempotency-key']===old).length,1);
+ assert.equal(posts.at(-1).body.rows[0].path,'/new');
 });

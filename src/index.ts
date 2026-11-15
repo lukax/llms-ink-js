@@ -19,7 +19,7 @@ export type { InspectionReceipt } from './inspect.ts';
 
 import { env } from './env.ts';
 
-export const VERSION = '0.8.2';
+export const VERSION = '0.8.3';
 export const DEFAULT_BASE_URL = 'https://llms.ink';
 
 /* ── Response shapes (mirror src/lib/schemas.ts of the API) ──────────────── */
@@ -196,6 +196,12 @@ export type ErrorCode =
   | 'invalid_key'
   | 'key_required'
   | 'site_claimed'
+  | 'site_unverified'
+  | 'verification_failed'
+  | 'verification_unavailable'
+  | 'transfer_required'
+  | 'traffic_retry_expired'
+  | 'idempotency_conflict'
   | 'not_found'
   | 'unknown_version'
   | 'method_not_allowed'

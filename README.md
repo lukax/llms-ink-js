@@ -175,15 +175,14 @@ With `traffic: { key, site?, flushEvery? }` the middleware also counts requests 
 user fetches (`ChatGPT-User`, `Claude-User`, `Perplexity-User`…, someone asked an assistant) and crawlers (`GPTBot`,
 `OAI-SearchBot`, `ClaudeBot`, `PerplexityBot`, `Googlebot`, `bingbot`…). It counts every request it sees, served or
 not, per path and agent in memory, and every `flushEvery` seconds (default 60, at least 10) sends the day's totals to
-`POST /api/v0/traffic`, at most 1000 rows per request. Only `{ site, period, rows: [{ path, agent, kind, count }] }`
-leaves your server: no IPs, user agents, query strings or cookies; browsers aren't counted. Sends never block a
+`POST /api/v0/traffic`, at most 1000 rows per request. The body contains only `{ site, period, rows: [{ path, agent, kind, count }] }`; a random retry identifier and deadline are sent in the `Idempotency-Key` header. There are no IPs, user agents, query strings or cookies; browsers aren't counted. Sends never block a
 response: with `ctx` they go to `ctx.waitUntil`, without one (Node, Bun, Deno) an unref'd timer sends. Failed sends
-keep their counts and retry with backoff (honoring `Retry-After`); a `401` or `403 site_claimed` stops counting with
+keep an unchanged batch and `Idempotency-Key` for up to 24 hours, retrying with backoff (honoring `Retry-After`). New counts stay separate. llms.ink applies each identifier once; an expired or conflicting batch is dropped with a warning because an earlier attempt may have succeeded. Do not reissue it with a new identifier. A `401` or `403` stops counting with
 one warning. `site` defaults to the middleware's hostname; verify the exact hostname at [llms.ink/traffic](https://llms.ink/traffic/) before enabling it. Restart the middleware after verification if it already stopped on 403. Counts not yet
 sent are lost when the process stops: call `await llms.flush()` on shutdown. Read them at
 [llms.ink/traffic](https://llms.ink/traffic/) or `GET /api/v0/traffic?site=&days=` with the same key.
 `classifyAgent(userAgent)` and `trafficCounter({ key, site })` (`record(request, ctx?)`, `flush()`) are exported for
-other servers.
+other servers. Retry receipts on llms.ink are bounded to 50,000 per site; capacity returns 429 without adding counts. Expired receipts are pruned on writes or the daily cleanup alarm. Earlier SDK versions and requests without the header retain additive behavior and can overcount after a lost response. Custom API deployments must implement this retry protocol before using the new middleware.
 
 ## Vercel AI SDK: `llms-ink/ai`
 
