@@ -307,7 +307,7 @@ JavaScript uses a 65-second total request deadline; pass `{ signal }` to cancel 
 `llms-ink/guard/claude` binds one Claude Agent SDK conversation to one authenticated local Guard session. Install the optional peer separately:
 
 ```sh
-npm install llms-ink@0.8.1 @anthropic-ai/claude-agent-sdk@0.3.319
+npm install llms-ink@0.8.2 @anthropic-ai/claude-agent-sdk@0.3.319
 ```
 
 First [start the Python 0.14.0 local service](https://llms.ink/guard/service/) with a reviewed gateway configuration and existing Claude authentication. Then try the bundled terminal host:
@@ -319,7 +319,7 @@ node node_modules/llms-ink/examples/guard-claude.mjs \
   --cwd /absolute/path/to/workspace
 ```
 
-It requires an interactive terminal and displays the complete review for each permitted action. Type `approve` to send that call once; Enter declines. `/exit`, terminal close and handled termination revoke the session. The example escapes terminal control characters rather than interpreting them. `--model` and `--claude-executable` are optional.
+It requires an interactive terminal and displays the complete review for each permitted action. Type `approve` to send that call once; Enter declines. `/exit`, terminal close and handled termination revoke the session. Model prose is prefixed with `Claude:`. Actual SDK tool responses appear separately under `Tool response`, with an error label for tool errors, the tool-use identifier and complete returned content. A response shows what the tool reported; it does not independently prove an external effect. Terminal and directional controls are escaped rather than interpreted. `--model` and `--claude-executable` are optional.
 
 For application hosts, import `createGuardedClaude` and pass absolute `ownerFile`, `python` and `cwd` paths plus `review: async ({message, signal}) => boolean`. Render `message` completely as plain text; abort the UI on `signal`. Only a fresh literal `true` accepts. The returned object exposes the non-secret `sessionId`, sequential `run(prompt, onMessage?)` and `close()`. Always await close in a finally block. Create a new instance for each independent conversation; there is no resume/fork interface. The owner file never enters the SDK's MCP configuration.
 

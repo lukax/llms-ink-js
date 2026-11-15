@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.2 — 2026-11-15
+
+- Show SDK tool responses and tool errors in the interactive terminal example, separately from Claude prose. Display the tool-use identifier and complete returned content; a response is not proof of an external effect.
+- Prefix every model prose line and escape carriage returns and directional controls so returned text cannot overwrite terminal labels. Keep existing explicit approval and cleanup behavior.
+- Exercise the actual shipped terminal entry point through a pseudo-terminal: responses, denials, prose-only turns, control characters, approval/decline, interruption and noninteractive refusal. The host API and Python requirement are unchanged.
+
 ## 0.8.1 — 2026-11-15
 
 - Publish the host lifetime binding below with the exported SDK `VERSION`, npm metadata and JSR metadata aligned. The failed 0.8.0 tag remains unchanged.

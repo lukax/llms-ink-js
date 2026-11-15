@@ -8,7 +8,7 @@ if(!process.stdin.isTTY || !process.stdout.isTTY) throw Error('This example requ
 if(!values['owner-file'] || !values.python || !values.cwd) throw Error('Pass --owner-file, --python and --cwd with absolute paths.');
 const terminal=createInterface({input:process.stdin,output:process.stdout});
 // Preserve complete text while making terminal controls and bidi controls visible.
-const plain=text=>text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));
+const plain=text=>text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));
 let conversation,stopping=false;
 const report=error=>{
  console.error(error instanceof GuardHostError?error.message:'The terminal conversation did not complete.');
@@ -33,7 +33,13 @@ try{
   if(prompt.trim()==='/exit')break;
   if(!prompt.trim())continue;
   await conversation.run(prompt,message=>{
-   if(message.type==='assistant')for(const part of message.message.content)if(part.type==='text')process.stdout.write(plain(part.text)+'\n');
+   if(message.type==='assistant')for(const part of message.message.content)if(part.type==='text'){
+    for(const line of plain(part.text).split('\n'))process.stdout.write('Claude: '+line+'\n');
+   }
+   if(message.type==='user' && Array.isArray(message.message.content))for(const part of message.message.content)if(part.type==='tool_result'){
+    process.stdout.write('\nTool response'+(part.is_error===true?' (error)':'')+'\n');
+    process.stdout.write(plain(JSON.stringify({toolUseId:part.tool_use_id,content:part.content},null,2))+'\n');
+   }
   });
  }
 }catch(error){if(!stopping){report(error);process.exitCode=1;}}

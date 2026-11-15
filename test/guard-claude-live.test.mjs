@@ -1,8 +1,17 @@
 // Explicit opt-in: uses authenticated Claude, a local model and inert local effects.
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {execFileSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 import {createGuardedClaude} from '../dist/guard-claude.js';
 import {fixture,python} from './guard-fixture.mjs';
+test('real terminal: declined and approved tool responses are visible and close revokes',{
+ skip:!python||process.env.LLMS_INK_CLAUDE_LIVE!=='1',timeout:240000,
+},()=>{
+ execFileSync(python,[fileURLToPath(new URL('./guard-terminal-live.py',import.meta.url))],{
+  env:{...process.env,LLMS_INK_TERMINAL_TEST_NODE:process.execPath},stdio:'pipe',timeout:230000,
+ });
+});
 test('real Claude SDK: repeated conversation turns, fresh approval, decline, cleanup',{
  skip:!python||process.env.LLMS_INK_CLAUDE_LIVE!=='1',timeout:180000,
 },async()=>{
