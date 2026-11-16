@@ -167,22 +167,40 @@ most hosts serve it before the middleware runs.
 ```ts
 const llms = llmsInkHandler({ site: 'https://example.com', traffic: { key: env.LLMS_INK_KEY } });
 const response = (await llms(request, ctx)) ?? (await app(request)); // Workers: ctx; Next.js proxy: the event
+llms.observe(request, response, ctx); // what agents got back: status and Content-Type only
 
-expressApp.use(llmsInkExpress({ site: 'https://example.com', traffic: { key: process.env.LLMS_INK_KEY } }));
+expressApp.use(llmsInkExpress({ site: 'https://example.com', traffic: { key: process.env.LLMS_INK_KEY } })); // observes by itself
 ```
 
 With `traffic: { key, site?, flushEvery? }` the middleware also counts requests from AI agents (`AI_AGENTS`):
 user fetches (`ChatGPT-User`, `Claude-User`, `Perplexity-User`…, someone asked an assistant) and crawlers (`GPTBot`,
 `OAI-SearchBot`, `ClaudeBot`, `PerplexityBot`, `Googlebot`, `bingbot`…). It counts every request it sees, served or
-not, per path and agent in memory, and every `flushEvery` seconds (default 60, at least 10) sends the day's totals to
+not, per path and agent in memory, and every `flushEvery` seconds (default 60, from 10 to 86,400) sends the day's totals to
 `POST /api/v0/traffic`, at most 1000 rows per request. The body contains only `{ site, period, rows: [{ path, agent, kind, count }] }`; a random retry identifier and deadline are sent in the `Idempotency-Key` header. There are no IPs, user agents, query strings or cookies; browsers aren't counted. Sends never block a
 response: with `ctx` they go to `ctx.waitUntil`, without one (Node, Bun, Deno) an unref'd timer sends. Failed sends
 keep an unchanged batch and `Idempotency-Key` for up to 24 hours, retrying with backoff (honoring `Retry-After`). New counts stay separate. llms.ink applies each identifier once; an expired or conflicting batch is dropped with a warning because an earlier attempt may have succeeded. Do not reissue it with a new identifier. A `401` or `403` stops counting with
 one warning. `site` defaults to the middleware's hostname; verify the exact hostname at [llms.ink/traffic](https://llms.ink/traffic/) before enabling it. Restart the middleware after verification if it already stopped on 403. Counts not yet
 sent are lost when the process stops: call `await llms.flush()` on shutdown. Read them at
 [llms.ink/traffic](https://llms.ink/traffic/) or `GET /api/v0/traffic?site=&days=` with the same key.
-`classifyAgent(userAgent)` and `trafficCounter({ key, site })` (`record(request, ctx?)`, `flush()`) are exported for
+`classifyAgent(userAgent)` and `trafficCounter({ key, site })` (`record(request, ctx?)`, `observe(request, response, ctx?)`, `flush()`) are exported for
 other servers. Retry receipts on llms.ink are bounded to 50,000 per site; capacity returns 429 without adding counts. Expired receipts are pruned on writes or the daily cleanup alarm. Earlier SDK versions and requests without the header retain additive behavior and can overcount after a lost response. Custom API deployments must implement this retry protocol before using the new middleware.
+
+**What agents got back.** `observe(request, response)` adds the response's outcome to the row its request was counted
+in (`classifyOutcome`: `ok`, `redirect`, `not_found`, `blocked`, `rate_limited`, `client_error`, `server_error`, or
+`markdown_missing` for HTML sent to a `.md` URL or an `Accept` that prefers Markdown). It reads only the status and
+`Content-Type`, never the body, and sends only outcome names and counts. Pass the same `Request` the handler saw; one
+outcome per request. Responses the handler serves itself are observed already, and the Express adapter observes the
+app's response when it finishes (aborted responses stay unobserved). Next.js middleware never sees the page's
+response, so its requests stay unobserved. A response arriving after its request was sent goes out as a row with
+`count: 0`; llms.ink 2026-11-15 or later accepts those.
+
+**Signed agents.** Requests carrying a Web Bot Auth signature (RFC 9421, Ed25519) are checked in the background
+against the signer's published keys and, when valid, counted as that signer's agent with `verified: 1`, even with a
+browser User-Agent (`SIGNED_AGENTS`: ChatGPT agent at `https://chatgpt.com`, Google-Agent at `https://agent.bot.goog`).
+Only those exact origins' `/.well-known/http-message-signatures-directory` are ever fetched (3 s timeout, 64 KB, no
+redirects, cached 5 minutes to a day). A failed check counts the request by User-Agent, or not at all. A valid
+signature identifies the operator, not a person or a permission, and can be replayed until it expires.
+`verifySignedAgent(request)` is exported.
 
 ## Vercel AI SDK: `llms-ink/ai`
 

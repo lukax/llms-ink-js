@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0 — 2026-11-16
+
+Needs the llms.ink API deployed on 2026-11-16 or later, which accepts `count: 0` rows, `outcomes` and `verified`. Custom API deployments without them reject batches that contain a `count: 0` row.
+
+- `observe(request, response, ctx?)` on the middleware handler and `trafficCounter`: records what each counted AI-agent request got back (`ok`, `redirect`, `not_found`, `blocked`, `rate_limited`, `client_error`, `server_error`, `markdown_missing`) from the status and `Content-Type` only. The outcome joins the day and row its request was counted in. A response arriving after a send goes out as a `count: 0` row. One outcome per request. The handler observes its own responses; the Express adapter observes the app's response on `finish`.
+- Web Bot Auth: signed requests (RFC 9421, Ed25519) are checked against `SIGNED_AGENTS` (ChatGPT agent, Google-Agent) and, when valid, counted as that agent with `verified`, whatever the User-Agent. Only those exact signer origins are fetched (no redirects, 3 s, 64 KB, cached 5 minutes to a day). Failed checks fall back to the User-Agent. `verifySignedAgent`, `classifyOutcome` and `TRAFFIC_OUTCOMES` are exported.
+- The Express adapter builds requests from the real `Host` (and Express's `protocol`), so signatures covering the authority verify.
+- `flushEvery` is limited to 10–86,400 seconds, and a server's `Retry-After` to one day. Larger values overflowed the timer, which then fired at once and sent repeatedly. Non-numeric `flushEvery` falls back to 60.
+
 ## 0.8.2 — 2026-11-15
 
 - Show SDK tool responses and tool errors in the interactive terminal example, separately from Claude prose. Display the tool-use identifier and complete returned content; a response is not proof of an external effect.

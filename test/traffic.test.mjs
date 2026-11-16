@@ -3,7 +3,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { AI_AGENTS, classifyAgent, trafficCounter, llmsInkHandler, llmsInkExpress } from '../dist/middleware.js';
+import { AI_AGENTS, classifyAgent, classifyOutcome, TRAFFIC_OUTCOMES, trafficCounter, llmsInkHandler, llmsInkExpress } from '../dist/middleware.js';
 import { VERSION } from '../dist/index.js';
 
 /** How the stub answers POST /api/v0/traffic. */
@@ -33,6 +33,7 @@ const server = createServer((req, res) => {
     };
     setTimeout(() => {
       if (stub.mode === 'busy') return problem(503, 'unavailable', { 'retry-after': '120' });
+      if (stub.mode === 'busy-years') return problem(503, 'unavailable', { 'retry-after': '99999999999' });
       if (stub.mode === 'claimed') return problem(403, 'site_claimed');
       if (stub.mode === 'bad') return problem(400, 'invalid_request');
       res.writeHead(202, { 'content-type': 'application/json' });
@@ -330,9 +331,9 @@ test('Express: llmsInkExpress counts requests from a real Node server and flush(
     assert.equal(posts.length, 0, 'counted in memory, not per request');
     await mw.flush();
     assert.deepEqual(sorted(posts[0].body.rows), [
-      { path: '/', agent: 'GPTBot', kind: 'crawler', count: 2 },
-      { path: '/llms.txt', agent: 'OAI-SearchBot', kind: 'crawler', count: 1 },
-      { path: '/pricing', agent: 'Perplexity-User', kind: 'user', count: 1 },
+      { path: '/', agent: 'GPTBot', kind: 'crawler', count: 2, outcomes: { ok: 2 } },
+      { path: '/llms.txt', agent: 'OAI-SearchBot', kind: 'crawler', count: 1, outcomes: { ok: 1 } },
+      { path: '/pricing', agent: 'Perplexity-User', kind: 'user', count: 1, outcomes: { ok: 1 } },
     ]);
   } finally {
     app.closeAllConnections();
@@ -365,4 +366,192 @@ test('expired uncertain batches are discarded with a warning; new counts use a n
  const lines=await warnings(()=>shifted(86400001,async()=>{counter.record(req('/new',UA.gptbot));await counter.flush();}));
  assert.match(lines.join(' '),/retry expired/);assert.equal(posts.filter(p=>p.headers['idempotency-key']===old).length,1);
  assert.equal(posts.at(-1).body.rows[0].path,'/new');
+});
+
+const html = (status = 200, type = 'text/html; charset=utf-8') => new Response(status === 204 || status === 304 ? null : '<p>x</p>', { status, headers: type ? { 'content-type': type } : {} });
+
+test('classifyOutcome: status classes, Markdown asked for and not served, and statuses that are not final', () => {
+  const r = (path, accept) => req(path, UA.chatgpt, accept ? { headers: { accept } } : {});
+  const cases = [
+    [r('/'), html(), 'ok'], [r('/'), html(204, null), 'ok'], [r('/'), html(304, null), 'ok'],
+    [r('/', 'text/markdown, text/html;q=0.9'), html(), 'markdown_missing'],
+    [r('/', 'text/markdown;q=0.5, text/html'), html(), 'ok'],
+    [r('/', 'text/markdown'), html(200, 'text/markdown; charset=utf-8'), 'ok'],
+    [r('/', 'text/markdown'), html(200, 'TEXT/PLAIN'), 'ok'],
+    [r('/', 'text/markdown'), html(200, null), 'ok'],
+    [r('/', 'text/markdown'), html(200, 'text/markdownish'), 'markdown_missing'],
+    [r('/guide.md'), html(), 'markdown_missing'], [r('/GUIDE.MD'), html(), 'markdown_missing'], [r('/guide.md'), html(200, 'text/x-markdown'), 'ok'],
+    [r('/'), html(301), 'redirect'], [r('/'), html(308), 'redirect'],
+    [r('/'), html(404), 'not_found'], [r('/'), html(410), 'not_found'],
+    [r('/'), html(401), 'blocked'], [r('/'), html(403), 'blocked'], [r('/'), html(451), 'blocked'],
+    [r('/'), html(429), 'rate_limited'], [r('/'), html(400), 'client_error'], [r('/'), html(405), 'client_error'],
+    [r('/'), html(500), 'server_error'], [r('/'), html(599), 'server_error'],
+  ];
+  for (const [request, response, want] of cases) assert.equal(classifyOutcome(request, response), want, `${request.url} ${request.headers.get('accept')} ${response.status} ${response.headers.get('content-type')}`);
+  for (const status of [0, 100, 199, 600, -1, 200.5, NaN, '200']) assert.equal(classifyOutcome(r('/'), { status, headers: new Headers() }), null, String(status));
+  assert.deepEqual([...TRAFFIC_OUTCOMES], ['ok', 'redirect', 'not_found', 'blocked', 'rate_limited', 'client_error', 'server_error', 'markdown_missing']);
+});
+
+test('observe: outcomes join the request’s row, once per request; uncounted and unknown requests are ignored; bodies are never read', async () => {
+  reset();
+  const counter = trafficCounter({ key: KEY, site: 'example.com', baseUrl });
+  const a = req('/docs', UA.chatgpt), b = req('/docs', UA.chatgpt), c = req('/gone', UA.gptbot), person = req('/docs', UA.chrome);
+  for (const r of [a, b, c, person]) counter.record(r);
+  let pulled = false;
+  const streamed = new Response(new ReadableStream({ pull() { pulled = true; throw new Error('read'); } }), { headers: { 'content-type': 'text/html' } });
+  counter.observe(a, streamed);
+  counter.observe(a, html(500)); // a second response for the same request is ignored
+  counter.observe(b, html(200, null));
+  counter.observe(c, html(404));
+  counter.observe(person, html(404));
+  counter.observe(req('/docs', UA.chatgpt), html(500)); // a different Request object was never counted
+  counter.observe(req('/never', UA.gptbot), html(500));
+  counter.observe(c, { status: 'nope', headers: null });
+  assert.equal(pulled, false); assert.equal(streamed.bodyUsed, false);
+  assert.equal(await streamed.text().catch(() => 'read attempted later'), 'read attempted later', 'the stream is left for the app');
+  await counter.flush();
+  assert.deepEqual(sorted(posts[0].body.rows), [
+    { path: '/docs', agent: 'ChatGPT-User', kind: 'user', count: 2, outcomes: { ok: 2 } },
+    { path: '/gone', agent: 'GPTBot', kind: 'crawler', count: 1, outcomes: { not_found: 1 } },
+  ]);
+});
+
+test('observe after a send: a count-0 row carries the outcome; a response after midnight stays on the request’s day', async () => {
+  reset();
+  const counter = trafficCounter({ key: KEY, site: 'example.com', baseUrl });
+  const early = req('/slow', UA.claudeUser);
+  counter.record(early);
+  await counter.flush();
+  counter.observe(early, html(503));
+  await counter.flush();
+  assert.deepEqual(posts[1].body.rows, [{ path: '/slow', agent: 'Claude-User', kind: 'user', count: 0, outcomes: { server_error: 1 } }]);
+
+  reset();
+  const toMidnight = Date.parse(`${today()}T23:59:59.900Z`) - Date.now();
+  const slow = await shifted(toMidnight - 50, () => trafficCounter({ key: KEY, site: 'example.com', baseUrl, flushEvery: 3600 }));
+  const late = req('/late', UA.gptbot);
+  const before = await shifted(toMidnight, () => { slow.record(late); return today(); });
+  const after = await shifted(toMidnight + 200, async () => {
+    slow.record(req('/late', UA.gptbot));
+    slow.observe(late, html(404));
+    await slow.flush();
+    return today();
+  });
+  assert.notEqual(before, after);
+  const byDay = Object.fromEntries(posts.map((p) => [p.body.period, p.body.rows]));
+  assert.deepEqual(byDay, {
+    [before]: [{ path: '/late', agent: 'GPTBot', kind: 'crawler', count: 1, outcomes: { not_found: 1 } }],
+    [after]: [{ path: '/late', agent: 'GPTBot', kind: 'crawler', count: 1 }],
+  });
+});
+
+test('observe past the memory bound: the outcome follows its request into /(other), never a new row', async () => {
+  reset();
+  const counter = trafficCounter({ key: KEY, site: 'example.com', baseUrl });
+  for (let i = 0; i < 5000; i++) counter.record(req(`/m/${i}`, UA.gptbot));
+  const extra = req('/overflow', UA.gptbot), first = req('/m/0', UA.gptbot);
+  counter.record(extra); counter.record(first);
+  counter.observe(extra, html(404)); counter.observe(first, html(301));
+  await counter.flush();
+  const rows = posts.flatMap((p) => p.body.rows);
+  assert.equal(rows.length, 5001);
+  assert.deepEqual(rows.find((r) => r.path === '/(other)'), { path: '/(other)', agent: 'GPTBot', kind: 'crawler', count: 1, outcomes: { not_found: 1 } });
+  assert.deepEqual(rows.find((r) => r.path === '/m/0').outcomes, { redirect: 1 });
+});
+
+test('observe privacy and stop: outcomes are names and counts only; a stopped counter ignores responses', async () => {
+  reset();
+  const counter = trafficCounter({ key: KEY, site: 'example.com', baseUrl });
+  const r = req('/x', UA.chatgpt, { headers: { accept: 'text/markdown' } });
+  counter.record(r);
+  counter.observe(r, new Response('secret body', { status: 200, headers: { 'content-type': 'text/html; charset=iso-8859-1', 'set-cookie': 'sid=abc', server: 'SecretServer/1' } }));
+  await counter.flush();
+  assert.deepEqual(Object.keys(posts[0].body.rows[0]).sort(), ['agent', 'count', 'kind', 'outcomes', 'path']);
+  assert.deepEqual(posts[0].body.rows[0].outcomes, { markdown_missing: 1 });
+  for (const secret of ['secret body', 'text/html', 'iso-8859', 'sid=abc', 'SecretServer', '"status"']) assert.ok(!posts[0].raw.includes(secret), secret);
+
+  reset(); stub.mode = 'claimed';
+  const stopped = trafficCounter({ key: KEY, site: 'example.com', baseUrl });
+  const s = req('/y', UA.gptbot);
+  stopped.record(s);
+  await warnings(() => stopped.flush());
+  stub.mode = 'ok';
+  stopped.observe(s, html(500));
+  await stopped.flush();
+  assert.equal(posts.length, 1, 'nothing after the stop');
+});
+
+test('middleware: its own responses are observed; the app’s through observe(); HEAD and not-ours requests too', async () => {
+  reset();
+  const llms = llmsInkHandler({ site: 'https://example.com', baseUrl, traffic: { key: KEY } });
+  const own = req('/llms.txt', UA.claudeUser);
+  assert.equal((await llms(own)).status, 200);
+  llms.observe(own, html(500)); // already observed by the handler
+  const head = req('/llms.txt', UA.claudeUser, { method: 'HEAD' });
+  assert.equal((await llms(head)).body, null);
+  for (const [path, response] of [['/missing', html(404)], ['/docs/a.md', html()], ['/docs/a', html()]]) {
+    const r = req(path, UA.chatgpt);
+    assert.equal(await llms(r), undefined);
+    llms.observe(r, response);
+  }
+  await llms.flush();
+  assert.deepEqual(sorted(posts[0].body.rows), sorted([
+    { path: '/docs/a', agent: 'ChatGPT-User', kind: 'user', count: 1, outcomes: { ok: 1 } },
+    { path: '/docs/a.md', agent: 'ChatGPT-User', kind: 'user', count: 1, outcomes: { markdown_missing: 1 } },
+    { path: '/llms.txt', agent: 'Claude-User', kind: 'user', count: 2, outcomes: { ok: 2 } },
+    { path: '/missing', agent: 'ChatGPT-User', kind: 'user', count: 1, outcomes: { not_found: 1 } },
+  ]));
+  const plain = llmsInkHandler({ site: 'https://example.com', baseUrl });
+  const r = req('/z', UA.gptbot);
+  await plain(r);
+  assert.doesNotThrow(() => plain.observe(r, html(404)), 'a no-op without traffic');
+});
+
+test('Express: outcomes from a real Node server, including errors, array headers and an aborted response', async () => {
+  reset();
+  const mw = llmsInkExpress({ site: 'https://example.com', baseUrl, traffic: { key: KEY } });
+  const app = createServer((rq, rs) => mw(rq, rs, () => {
+    const path = new URL(rq.url, 'http://x').pathname;
+    if (path === '/hang') return; // never answers: the client gives up
+    if (path === '/boom') { rs.statusCode = 500; return rs.end('err'); }
+    if (path === '/gone') { rs.statusCode = 410; return rs.end(); }
+    if (path === '/api.md') { rs.setHeader('content-type', ['text/html']); return rs.end('<p>'); }
+    rs.setHeader('content-type', 'text/html'); rs.end('<h1>app</h1>');
+  }));
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${app.address().port}`;
+  try {
+    for (const path of ['/', '/boom', '/gone', '/api.md']) await (await fetch(origin + path, { headers: { 'user-agent': UA.perplexityUser } })).text();
+    await fetch(origin + '/hang', { headers: { 'user-agent': UA.perplexityUser }, signal: AbortSignal.timeout(200) }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await mw.flush();
+    assert.deepEqual(sorted(posts[0].body.rows), sorted([
+      { path: '/', agent: 'Perplexity-User', kind: 'user', count: 1, outcomes: { ok: 1 } },
+      { path: '/api.md', agent: 'Perplexity-User', kind: 'user', count: 1, outcomes: { markdown_missing: 1 } },
+      { path: '/boom', agent: 'Perplexity-User', kind: 'user', count: 1, outcomes: { server_error: 1 } },
+      { path: '/gone', agent: 'Perplexity-User', kind: 'user', count: 1, outcomes: { not_found: 1 } },
+      { path: '/hang', agent: 'Perplexity-User', kind: 'user', count: 1 },
+    ]));
+  } finally {
+    app.closeAllConnections();
+    app.close();
+  }
+});
+
+test('timers never overflow: huge or invalid flushEvery and Retry-After values do not send at once', async () => {
+  for (const flushEvery of [1e12, Infinity, NaN]) {
+    reset();
+    const counter = trafficCounter({ key: KEY, site: 'example.com', baseUrl, flushEvery });
+    counter.record(req('/a', UA.gptbot));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(posts.length, 0, String(flushEvery));
+  }
+  reset(); stub.mode = 'busy-years';
+  const counter = trafficCounter({ key: KEY, site: 'example.com', baseUrl });
+  counter.record(req('/a', UA.gptbot));
+  await counter.flush();
+  stub.mode = 'ok';
+  counter.record(req('/b', UA.gptbot));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(posts.length, 1, 'the retry waits instead of firing an overflowed timer');
 });

@@ -1,13 +1,14 @@
 /**
- * AI traffic: which AI agents fetch which pages of your site, counted in memory and sent to llms.ink as daily
- * aggregates (`POST /api/v0/traffic`). Only requests from the agents in {@link AI_AGENTS} are counted; what leaves
- * your server is `{ site, period, rows: [{ path, agent, kind, count }] }` — no IPs, no user agents, no query
- * strings, no cookies, nothing about people who visit.
+ * AI traffic: which AI agents fetch which pages of your site, and what they got back, counted in memory and sent to
+ * llms.ink as daily aggregates (`POST /api/v0/traffic`). Only requests from the agents in {@link AI_AGENTS} are
+ * counted; what leaves your server is `{ site, period, rows: [{ path, agent, kind, count, outcomes? }] }` — no IPs,
+ * no user agents, no query strings, no cookies, no status codes or bodies, nothing about people who visit.
  *
  * @module
  */
 
 import { DEFAULT_BASE_URL, VERSION } from './index.ts';
+import { verifySignedAgent } from './signatures.ts';
 
 /** `user`: fetched because someone asked an assistant; `crawler`: indexing for search or collecting for training. */
 export type AgentKind = 'user' | 'crawler';
@@ -65,22 +66,82 @@ export function classifyAgent(userAgent: string | null | undefined): AiAgent | n
   return match ? BY_TOKEN.get(match[1]!.toLowerCase()) ?? null : null;
 }
 
+/**
+ * What a response gave the agent, from its status and `Content-Type` only. `markdown_missing`: a 2xx that isn't
+ * Markdown (or plain text) for a `.md` URL or an `Accept` that prefers `text/markdown`.
+ */
+export type TrafficOutcome = 'ok' | 'redirect' | 'not_found' | 'blocked' | 'rate_limited' | 'client_error' | 'server_error' | 'markdown_missing';
+
+/** Every {@link TrafficOutcome}, in the API's order. */
+export const TRAFFIC_OUTCOMES: readonly TrafficOutcome[] = ['ok', 'redirect', 'not_found', 'blocked', 'rate_limited', 'client_error', 'server_error', 'markdown_missing'];
+
+/** The parts of a response {@link classifyOutcome} reads: never the body. */
+export interface ResponseLike {
+  status: number;
+  headers: { get(name: string): string | null };
+}
+
+const MARKDOWN_TYPES = /^(text\/markdown|text\/x-markdown|text\/plain)\s*(;|$)/i;
+
+/**
+ * The outcome of `request` answered with `response`, or null for a status that isn't a final HTTP response.
+ * A 2xx without a `Content-Type` counts as `ok`: no evidence of a mismatch.
+ */
+export function classifyOutcome(request: Request, response: ResponseLike): TrafficOutcome | null {
+  const status = response.status;
+  if (!Number.isInteger(status) || status < 200 || status > 599) return null;
+  if (status === 304) return 'ok';
+  if (status >= 500) return 'server_error';
+  if (status === 429) return 'rate_limited';
+  if (status === 404 || status === 410) return 'not_found';
+  if (status === 401 || status === 403 || status === 451) return 'blocked';
+  if (status >= 400) return 'client_error';
+  if (status >= 300) return 'redirect';
+  const type = response.headers.get('content-type');
+  if (!type || MARKDOWN_TYPES.test(type.trim())) return 'ok';
+  // Asked for Markdown: a `.md` URL, or an `Accept` that prefers it.
+  const wanted = /\.md$/i.test(new URL(request.url).pathname) || prefersMarkdown(request.headers.get('accept') ?? '');
+  return wanted ? 'markdown_missing' : 'ok';
+}
+
+/**
+ * Whether `Accept` names `text/markdown` with a quality at least that of `text/html` (or, when `text/html`
+ * isn't listed, `text/*`, then `*\/*`). Browsers never list `text/markdown`.
+ */
+export function prefersMarkdown(accept: string): boolean {
+  let markdown = 0;
+  const html: Record<string, number> = {};
+  for (const part of accept.toLowerCase().split(',')) {
+    const [type = '', ...params] = part.split(';').map((s) => s.trim());
+    const q = params.find((p) => p.startsWith('q='));
+    const quality = q === undefined ? 1 : Number(q.slice(2));
+    if (!Number.isFinite(quality)) continue;
+    if (type === 'text/markdown' || type === 'text/x-markdown') markdown = Math.max(markdown, quality);
+    else if (type === 'text/html' || type === 'text/*' || type === '*/*') html[type] = Math.max(html[type] ?? 0, quality);
+  }
+  return markdown > 0 && markdown >= (html['text/html'] ?? html['text/*'] ?? html['*/*'] ?? 0);
+}
+
 /** Options for {@link trafficCounter}, and the middleware's `traffic` option. */
 export interface TrafficOptions {
   /** API key (`lk_…`). Verify the hostname at llms.ink/traffic first; account keys share verified sites. */
   key: string;
   /** Hostname the counts are filed under, e.g. `example.com`. The middleware defaults it to its `site`. */
   site?: string;
-  /** Seconds between sends. Default 60, at least 10. */
+  /** Seconds between sends. Default 60, from 10 to 86,400 (larger timer delays overflow and fire at once). */
   flushEvery?: number;
 }
 
-/** One aggregate: requests from one agent to one path in one UTC day. */
+/** One aggregate: requests from one agent to one path in one UTC day, and the responses seen for them. */
 export interface TrafficRow {
   path: string;
   agent: string;
   kind: AgentKind;
+  /** Requests counted; 0 when the row carries only outcomes of requests counted in an earlier batch. */
   count: number;
+  /** Of `count`, requests with a valid Web Bot Auth signature from the agent's operator (see `SIGNED_AGENTS`). */
+  verified?: number;
+  outcomes?: Partial<Record<TrafficOutcome, number>>;
 }
 
 /** The body of `POST /api/v0/traffic`. */
@@ -99,10 +160,18 @@ export interface WaitUntil {
 /** Counts AI-agent requests and sends them in the background. */
 export interface TrafficCounter {
   /**
-   * Counts the request when an AI agent sent it (`GET`/`HEAD` only). When a send is due it starts one and hands it
-   * to `ctx.waitUntil`; without `ctx`, a background timer sends. Never throws and never waits.
+   * Counts the request when an AI agent sent it (`GET`/`HEAD` only). A request with a valid Web Bot Auth signature
+   * from a known signer counts as that signer's agent, verified, whatever its User-Agent; signatures are checked in
+   * the background (kept alive by `ctx`). When a send is due it starts one and hands it to `ctx.waitUntil`; without
+   * `ctx`, a background timer sends. Never throws and never waits.
    */
   record(request: Request, ctx?: WaitUntil): void;
+  /**
+   * Adds what a request counted by {@link record} got back: pass the same `Request` object and the response you
+   * send. Reads only the status and `Content-Type`. Once per request; uncounted requests and later calls are ignored.
+   * Never throws.
+   */
+  observe(request: Request, response: ResponseLike, ctx?: WaitUntil): void;
   /** Sends everything counted so far. Never rejects; transient failures retry the unchanged batch for up to 24 hours. Counts remain in memory only. */
   flush(): Promise<void>;
 }
@@ -134,12 +203,24 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
   if (!key) throw new TypeError('traffic needs an llms.ink API key (traffic: { key: "lk_…" }).');
   // `https://Example.com/x` or `example.com` → `example.com`.
   const site = new URL(/^https?:\/\//i.test(options.site) ? options.site : `https://${options.site}`).hostname.toLowerCase();
-  const every = Math.max(10, options.flushEvery ?? 60) * 1000;
+  const seconds = Number.isFinite(options.flushEvery) ? options.flushEvery! : 60;
+  const every = Math.min(86_400, Math.max(10, seconds)) * 1000;
   const endpoint = `${(options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '')}/api/v0/traffic`;
   const headers = { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'user-agent': `llms-ink-js/${VERSION}` };
 
   /** `period\tpath\tagent` → row. */
   const pending = new Map<string, TrafficRow & { period: string }>();
+  interface Counted {
+    period: string;
+    path: string;
+    /** Set once counted; a signed request waits for its signature check. */
+    agent?: { agent: string; kind: AgentKind };
+    /** A response observed before the signature check settled. */
+    outcome?: TrafficOutcome;
+    observed?: boolean;
+  }
+  /** Counted requests waiting for their response: the row they count in, so a late response can't move days. */
+  const counted = new WeakMap<Request, Counted>();
   let queued: OutboundBatch[] = [];
   let lastSend = Date.now();
   let retryAt = 0;
@@ -149,7 +230,8 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
   /** Set when llms.ink refuses the key or the site: counting stops, once, with a warning. */
   let stopped = false;
 
-  function add(period: string, path: string, agent: string, kind: AgentKind, count: number) {
+  /** Adds to a row (a new one past {@link MAX_PENDING} folds into {@link OTHER_PATH}); returns the path used. */
+  function add(period: string, path: string, agent: string, kind: AgentKind, count: number, outcome?: TrafficOutcome, verified = 0): string {
     let id = `${period}\t${path}\t${agent}`;
     let row = pending.get(id);
     if (!row && pending.size >= MAX_PENDING) {
@@ -157,8 +239,22 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
       id = `${period}\t${path}\t${agent}`;
       row = pending.get(id);
     }
-    if (row) row.count += count;
-    else pending.set(id, { period, path, agent, kind, count });
+    if (!row) { row = { period, path, agent, kind, count: 0 }; pending.set(id, row); }
+    row.count += count;
+    if (verified) row.verified = (row.verified ?? 0) + verified;
+    if (outcome) { row.outcomes ??= {}; row.outcomes[outcome] = (row.outcomes[outcome] ?? 0) + 1; }
+    return path;
+  }
+
+  /** Starts a due send (kept alive by `ctx`), or arms the background timer. */
+  function schedule(now: number, ctx?: WaitUntil) {
+    const due = now - lastSend >= every || pending.size >= ROWS_PER_POST;
+    if (!inflight && now >= retryAt && due) {
+      const sending = flush();
+      ctx?.waitUntil(sending);
+    } else if (!ctx) {
+      arm();
+    }
   }
 
   function stop(message: string) {
@@ -171,7 +267,7 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
 
   function retryLater(retryAfter: number | null) {
     backoff = Math.min(MAX_BACKOFF_MS, Math.max(every, backoff * 2));
-    retryAt = Date.now() + Math.max(backoff, (retryAfter ?? 0) * 1000);
+    retryAt = Date.now() + Math.max(backoff, Math.min(86_400, retryAfter ?? 0) * 1000);
   }
 
   /** One POST; resolves to what to do with its rows. */
@@ -220,9 +316,9 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
     const crypto = globalThis.crypto ?? (await import('node:crypto')).webcrypto;
     const expires = Date.now() + RETRY_LIFETIME_MS;
     const byPeriod = new Map<string, TrafficRow[]>();
-    for (const { period, path, agent, kind, count } of pending.values()) {
+    for (const { period, ...row } of pending.values()) {
       let rows = byPeriod.get(period); if (!rows) { rows = []; byPeriod.set(period, rows); }
-      rows.push({ path, agent, kind, count });
+      rows.push(row);
     }
     const batches: OutboundBatch[] = [];
     for (const [period, rows] of byPeriod) for (let i = 0; i < rows.length; i += ROWS_PER_POST) {
@@ -250,7 +346,8 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
   /** A background send where nothing keeps one alive (Node, Bun, Deno); unref'd so it never holds the process open. */
   function arm() {
     if (timer) return;
-    const delay = Math.max(1000, Math.max(lastSend + every, retryAt) - Date.now());
+    // A day at most: a huge Retry-After would overflow the timer and fire at once.
+    const delay = Math.min(86_400_000, Math.max(1000, Math.max(lastSend + every, retryAt) - Date.now()));
     timer = setTimeout(() => {
       timer = undefined;
       void flush();
@@ -263,17 +360,41 @@ export function trafficCounter(options: TrafficOptions & { site: string; baseUrl
     record(request, ctx) {
       try {
         if (stopped || (request.method !== 'GET' && request.method !== 'HEAD')) return;
-        const agent = classifyAgent(request.headers.get('user-agent'));
-        if (!agent) return;
+        const claimed = classifyAgent(request.headers.get('user-agent'));
+        const signed = request.headers.has('signature') && request.headers.has('signature-input') && request.headers.has('signature-agent');
+        if (!claimed && !signed) return;
         const now = Date.now();
-        add(new Date(now).toISOString().slice(0, 10), cleanPath(request.url), agent.agent, agent.kind, 1);
-        const due = now - lastSend >= every || pending.size >= ROWS_PER_POST;
-        if (!inflight && now >= retryAt && due) {
-          const sending = flush();
-          ctx?.waitUntil(sending);
-        } else if (!ctx) {
-          arm();
+        const entry: Counted = { period: new Date(now).toISOString().slice(0, 10), path: cleanPath(request.url) };
+        counted.set(request, entry);
+        if (!signed) {
+          entry.path = add(entry.period, entry.path, claimed!.agent, claimed!.kind, 1);
+          entry.agent = claimed!;
+          schedule(now, ctx);
+          return;
         }
+        // Counted once the signature is checked: as the signer's agent when it verifies, else by User-Agent.
+        const settled = verifySignedAgent(request, now).then((signer) => {
+          const agent = signer ?? claimed;
+          if (!agent || stopped) return;
+          entry.path = add(entry.period, entry.path, agent.agent, agent.kind, 1, entry.outcome, signer ? 1 : 0);
+          entry.agent = agent;
+          schedule(Date.now(), ctx);
+        });
+        ctx?.waitUntil(settled);
+      } catch {
+        // Counting must never break the site.
+      }
+    },
+    observe(request, response, ctx) {
+      try {
+        const entry = counted.get(request);
+        if (!entry || entry.observed || stopped) return;
+        const outcome = classifyOutcome(request, response);
+        if (!outcome) return;
+        entry.observed = true;
+        if (!entry.agent) { entry.outcome = outcome; return; } // applied when its signature check settles
+        add(entry.period, entry.path, entry.agent.agent, entry.agent.kind, 0, outcome);
+        schedule(Date.now(), ctx);
       } catch {
         // Counting must never break the site.
       }

@@ -19,7 +19,7 @@ export type { InspectionReceipt } from './inspect.ts';
 
 import { env } from './env.ts';
 
-export const VERSION = '0.8.3';
+export const VERSION = '0.9.0';
 export const DEFAULT_BASE_URL = 'https://llms.ink';
 
 /* ── Response shapes (mirror src/lib/schemas.ts of the API) ──────────────── */

@@ -1,7 +1,7 @@
 /**
  * Serve llms.txt, llms-full.txt and (optionally) Markdown versions of pages from llms.ink, inside your own app, and
- * (optionally) count AI-agent traffic. A fetch-API handler for Cloudflare Workers, Next.js middleware, Deno, Bun and
- * Hono, plus an Express/Connect adapter.
+ * (optionally) count AI-agent traffic and what it got back. A fetch-API handler for Cloudflare Workers, Next.js
+ * middleware, Deno, Bun and Hono, plus an Express/Connect adapter.
  *
  * @example
  * ```ts
@@ -10,7 +10,9 @@
  * const llms = llmsInkHandler({ site: 'https://example.com', markdown: true });
  * export default {
  *   async fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> {
- *     return (await llms(request, ctx)) ?? fetch(request); // undefined: not ours, the app answers
+ *     const response = (await llms(request, ctx)) ?? (await fetch(request)); // undefined: not ours, the app answers
+ *     llms.observe(request, response, ctx); // with `traffic`: records what AI agents got back
+ *     return response;
  *   },
  * };
  * ```
@@ -20,9 +22,10 @@
 
 import { env } from './env.ts';
 import { DEFAULT_BASE_URL, VERSION, type Mode } from './index.ts';
-import { trafficCounter, type TrafficOptions, type WaitUntil } from './traffic.ts';
+import { prefersMarkdown, trafficCounter, type ResponseLike, type TrafficOptions, type WaitUntil } from './traffic.ts';
 
-export { AI_AGENTS, classifyAgent, trafficCounter, type AgentKind, type AiAgent, type TrafficBatch, type TrafficCounter, type TrafficOptions, type TrafficRow, type WaitUntil } from './traffic.ts';
+export { AI_AGENTS, classifyAgent, classifyOutcome, TRAFFIC_OUTCOMES, trafficCounter, type AgentKind, type AiAgent, type ResponseLike, type TrafficBatch, type TrafficCounter, type TrafficOptions, type TrafficOutcome, type TrafficRow, type WaitUntil } from './traffic.ts';
+export { SIGNED_AGENTS, verifySignedAgent, type SignedAgent } from './signatures.ts';
 
 /** Options for {@link llmsInkHandler} and {@link llmsInkExpress}. */
 export interface LlmsInkHandlerOptions {
@@ -43,7 +46,8 @@ export interface LlmsInkHandlerOptions {
   /**
    * Count requests from AI agents (ChatGPT-User, Claude-User, GPTBot, ClaudeBot… see `AI_AGENTS`) per path and send
    * daily aggregates to llms.ink every `flushEvery` seconds; read them at https://llms.ink/traffic/. Sends only
-   * `{ path, agent, kind, count }`: no IPs, user agents, query strings or cookies. Off unless set.
+   * `{ path, agent, kind, count }` plus outcome counts (`ok`, `not_found`…) for responses passed to `observe`: no
+   * IPs, user agents, query strings, cookies, status codes or bodies. Off unless set.
    */
   traffic?: TrafficOptions;
 }
@@ -54,6 +58,12 @@ export interface LlmsInkHandlerOptions {
  */
 export interface LlmsInkHandler {
   (request: Request, ctx?: WaitUntil): Promise<Response | undefined>;
+  /**
+   * With `traffic`: records what an AI agent's request got back. Pass the request given to the handler and the
+   * response your app sends; reads only its status and `Content-Type`. Responses the handler served itself are
+   * already recorded. A no-op without `traffic`.
+   */
+  observe(request: Request, response: ResponseLike, ctx?: WaitUntil): void;
   /** Sends the traffic counted so far (with `traffic`); resolves at once without it. */
   flush(): Promise<void>;
 }
@@ -152,9 +162,14 @@ export function llmsInkHandler(options: LlmsInkHandlerOptions): LlmsInkHandler {
     } else {
       return undefined;
     }
-    return request.method === 'HEAD' ? new Response(null, response) : response;
+    const final = request.method === 'HEAD' ? new Response(null, response) : response;
+    traffic?.observe(request, final, ctx);
+    return final;
   };
-  return Object.assign(handler, { flush: () => traffic?.flush() ?? Promise.resolve() });
+  return Object.assign(handler, {
+    observe: (request: Request, response: ResponseLike, ctx?: WaitUntil) => traffic?.observe(request, response, ctx),
+    flush: () => traffic?.flush() ?? Promise.resolve(),
+  });
 }
 
 /** Node's `IncomingMessage` (Express, Connect, plain `node:http`), as far as the adapter reads it. */
@@ -163,14 +178,19 @@ export interface NodeRequest {
   url?: string;
   /** Express: the URL before mounting stripped a prefix. */
   originalUrl?: string;
+  /** Express: `https` behind a trusted TLS proxy; signatures covering `@target-uri` need it. */
+  protocol?: string;
   headers: Record<string, string | string[] | undefined>;
 }
 
-/** Node's `ServerResponse`, as far as the adapter writes it. */
+/** Node's `ServerResponse`, as far as the adapter writes and reads it. */
 export interface NodeResponse {
   statusCode: number;
   setHeader(name: string, value: string): unknown;
   end(chunk: Uint8Array): unknown;
+  /** Read once the app finished, for traffic outcomes. */
+  getHeader?(name: string): number | string | string[] | undefined;
+  once?(event: 'finish', listener: () => void): unknown;
 }
 
 /** Express/Connect middleware: `next()` when the request isn't one {@link llmsInkHandler} serves. */
@@ -185,14 +205,25 @@ export function llmsInkExpress(options: LlmsInkHandlerOptions): NodeMiddleware {
   const handle = llmsInkHandler(options);
   const middleware = (req: NodeRequest, res: NodeResponse, next: (err?: unknown) => void): void => {
     const headers = new Headers();
-    for (const name of ['accept', 'user-agent']) {
+    // Signatures cover the authority the agent addressed, so the request keeps the real Host.
+    for (const name of ['accept', 'user-agent', 'signature', 'signature-input', 'signature-agent']) {
       const value = req.headers[name];
       if (typeof value === 'string') headers.set(name, value);
     }
-    const request = new Request(new URL(req.originalUrl ?? req.url ?? '/', 'http://localhost'), { method: req.method, headers });
+    let base = new URL('http://localhost');
+    const host = req.headers.host;
+    if (typeof host === 'string' && host) try { base = new URL(`${req.protocol === 'https' ? 'https' : 'http'}://${host}`); } catch { /* not a host: keep localhost */ }
+    const request = new Request(new URL(req.originalUrl ?? req.url ?? '/', base), { method: req.method, headers });
     handle(request)
       .then(async (response) => {
-        if (!response) return next();
+        if (!response) {
+          // The app answers: record what it sent once the response is complete. Aborted responses stay unobserved.
+          if (options.traffic) res.once?.('finish', () => handle.observe(request, {
+            status: res.statusCode,
+            headers: { get: (name) => { const value = res.getHeader?.(name); return value === undefined ? null : Array.isArray(value) ? value.join(', ') : String(value); } },
+          }));
+          return next();
+        }
         res.statusCode = response.status;
         response.headers.forEach((value, name) => res.setHeader(name, value));
         res.end(new Uint8Array(await response.arrayBuffer()));
@@ -234,20 +265,3 @@ function isPage(pathname: string): boolean {
   return !last.includes('.') || /\.html?$/i.test(last);
 }
 
-/**
- * Whether `Accept` names `text/markdown` with a quality at least that of `text/html` (or, when `text/html`
- * isn't listed, `text/*`, then `*\/*`). Browsers never list `text/markdown`, so they get the app.
- */
-function prefersMarkdown(accept: string): boolean {
-  let markdown = 0;
-  const html: Record<string, number> = {};
-  for (const part of accept.toLowerCase().split(',')) {
-    const [type = '', ...params] = part.split(';').map((s) => s.trim());
-    const q = params.find((p) => p.startsWith('q='));
-    const quality = q === undefined ? 1 : Number(q.slice(2));
-    if (!Number.isFinite(quality)) continue;
-    if (type === 'text/markdown' || type === 'text/x-markdown') markdown = Math.max(markdown, quality);
-    else if (type === 'text/html' || type === 'text/*' || type === '*/*') html[type] = Math.max(html[type] ?? 0, quality);
-  }
-  return markdown > 0 && markdown >= (html['text/html'] ?? html['text/*'] ?? html['*/*'] ?? 0);
-}
